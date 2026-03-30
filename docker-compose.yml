@@ -1,0 +1,19 @@
+services:
+  bouncie-mcp:
+    build: .
+    container_name: bouncie-mcp
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    env_file:
+      - .env
+    environment:
+      - PORT=3000
+    networks:
+      - default
+      - tunnel
+
+networks:
+  tunnel:
+    external: true
+    name: cloudflared-tunnel-macmini_tunnel

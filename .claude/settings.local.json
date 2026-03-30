@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone:*)",
+      "Bash(grep -r http /tmp/ha-bouncie/custom_components/bouncie/ --include=*.py)",
+      "Bash(grep -r \"client_id\\\\|client_secret\\\\|oauth\\\\|token\" /tmp/ha-bouncie/custom_components/bouncie/ --include=*.py -A 2 -B 2)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(node -e \"const z = require\\(''@modelcontextprotocol/sdk/server/mcp.js''\\); console.log\\(''ok''\\)\")",
+      "Bash(node -e \"import\\(''@modelcontextprotocol/sdk/server/mcp.js''\\).then\\(\\(\\) => console.log\\(''ok''\\)\\)\")",
+      "Bash(npx vitest:*)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(grep -E \"\\\\.d\\\\.ts$\")",
+      "Bash(cloudflared tunnel:*)",
+      "Read(//Users/henry/.cloudflared/**)",
+      "Bash(docker build:*)",
+      "Bash(docker compose:*)",
+      "Bash(curl:*)",
+      "Bash(docker network:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker ps:*)",
+      "Bash(python3 -m json.tool)",
+      "Bash(git init:*)"
+    ]
+  }
+}
