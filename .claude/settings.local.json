@@ -12,8 +12,6 @@
       "Bash(npm run:*)",
       "Bash(npm test:*)",
       "Bash(grep -E \"\\\\.d\\\\.ts$\")",
-      "Bash(cloudflared tunnel:*)",
-      "Read(//Users/henry/.cloudflared/**)",
       "Bash(docker build:*)",
       "Bash(docker compose:*)",
       "Bash(curl:*)",
@@ -21,7 +19,9 @@
       "Bash(docker inspect:*)",
       "Bash(docker ps:*)",
       "Bash(python3 -m json.tool)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

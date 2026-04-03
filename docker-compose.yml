@@ -9,11 +9,3 @@ services:
       - .env
     environment:
       - PORT=3000
-    networks:
-      - default
-      - tunnel
-
-networks:
-  tunnel:
-    external: true
-    name: cloudflared-tunnel-macmini_tunnel
