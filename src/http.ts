@@ -4,15 +4,17 @@ import express from "express";
 import crypto from "crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "./server.js";
-import { createOAuthRouter, isValidToken } from "./oauth.js";
+import { createOAuthRouter, isValidToken, getBouncieToken } from "./oauth.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
-const OAUTH_PASSWORD = process.env.OAUTH_PASSWORD;
 const TOKEN_TTL_HOURS = parseInt(process.env.TOKEN_TTL_HOURS || "24", 10);
 
-if (!OAUTH_PASSWORD) {
-  console.error("Missing required OAUTH_PASSWORD environment variable");
+const BOUNCIE_CLIENT_ID = process.env.BOUNCIE_CLIENT_ID;
+const BOUNCIE_CLIENT_SECRET = process.env.BOUNCIE_CLIENT_SECRET;
+
+if (!BOUNCIE_CLIENT_ID || !BOUNCIE_CLIENT_SECRET) {
+  console.error("Missing required BOUNCIE_CLIENT_ID and/or BOUNCIE_CLIENT_SECRET environment variables");
   process.exit(1);
 }
 
@@ -32,24 +34,28 @@ app.use((req, res, next) => {
   express.urlencoded({ extended: true })(req, res, next);
 });
 
-// OAuth routes
+// OAuth routes — Bouncie OAuth proxy
 app.use(createOAuthRouter({
   publicUrl: PUBLIC_URL,
-  oauthPassword: OAUTH_PASSWORD,
   tokenTtlMs: TOKEN_TTL_HOURS * 60 * 60 * 1000,
+  bouncieClientId: BOUNCIE_CLIENT_ID,
+  bouncieClientSecret: BOUNCIE_CLIENT_SECRET,
 }));
 
-// Bearer token auth for /mcp
+// Bearer token auth for /mcp — extract Bouncie token for the session
 app.use("/mcp", (req, res, next) => {
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
-  if (!isValidToken(auth.slice(7))) {
+  const mcpToken = auth.slice(7);
+  if (!isValidToken(mcpToken)) {
     res.status(401).json({ error: "Invalid or expired token" });
     return;
   }
+  // Attach Bouncie token to request for downstream use
+  (req as any).bouncieAccessToken = getBouncieToken(mcpToken);
   next();
 });
 
@@ -75,7 +81,10 @@ app.post("/mcp", async (req, res) => {
     return;
   }
 
-  const mcpServer = createServer();
+  // Create a new MCP server with this user's Bouncie token
+  const bouncieAccessToken = (req as any).bouncieAccessToken as string | undefined;
+  const mcpServer = createServer({ bouncieAccessToken: bouncieAccessToken ?? undefined });
+
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
     onsessioninitialized: (sid) => {
@@ -125,7 +134,7 @@ app.get("/health", (_req, res) => {
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Bouncie MCP listening on http://0.0.0.0:${PORT}/mcp`);
-  console.log(`OAuth endpoints: /authorize, /token, /register`);
+  console.log(`OAuth: users authorize via Bouncie at /authorize`);
   console.log(`Public URL: ${PUBLIC_URL}`);
 });
 

@@ -1,55 +1,35 @@
 # Bouncie MCP Server
 
-An MCP (Model Context Protocol) server that exposes the [Bouncie](https://bouncie.com) vehicle tracking API. Connect your Bouncie OBD2 device data to any MCP-compatible AI assistant.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the [Bouncie](https://bouncie.com) OBD2 vehicle tracking API. Give Claude, ChatGPT, or any MCP-compatible AI assistant real-time access to your vehicle data — location, trips, diagnostics, fuel level, and more.
+
+## What it does
+
+Connect your Bouncie GPS tracker to AI. Ask natural language questions like:
+
+- "Where is my car right now?"
+- "Show me my trips from last week"
+- "Is my check engine light on? What codes?"
+- "How much fuel do I have left?"
+- "What was my longest drive this week?"
 
 ## Features
 
-- **Vehicle info** — make, model, year, VIN, engine, nickname
-- **Live vehicle stats** — GPS location, speed, fuel level, odometer, engine running status
-- **Vehicle health** — battery status, check engine light (MIL), diagnostic trouble codes (DTCs)
-- **Trip history** — distance, duration, speeds, fuel consumed, hard braking/acceleration, GPS traces
-- **User profile** — authenticated user information
+- **Real-time vehicle tracking** — GPS location, speed, heading, address
+- **Trip history & analytics** — distance, duration, average/max speed, fuel consumed, hard braking & acceleration counts, GPS traces (polyline or GeoJSON)
+- **Vehicle diagnostics** — check engine light (MIL) status, OBD2 diagnostic trouble codes (DTCs), battery health
+- **Vehicle info** — make, model, year, VIN, engine, odometer, fuel level
+- **OAuth 2.0 + PKCE** — secure authentication for hosted/remote deployments (compatible with Claude.ai)
+- **Docker + Cloudflare Tunnel ready** — deploy anywhere with HTTPS
 
-## Prerequisites
+## Quick Start
 
-1. A [Bouncie](https://bouncie.com) account with at least one connected device
-2. A Bouncie developer app — register at [bouncie.dev](https://www.bouncie.dev)
-3. Node.js 18+
-
-## Setup
-
-### 1. Install
+### Local (stdio) mode
 
 ```bash
-npm install
-npm run build
+npm install && npm run build
 ```
 
-### 2. Get Bouncie API credentials
-
-1. Go to [bouncie.dev](https://www.bouncie.dev) and create an app
-2. Note your **Client ID** and **Client Secret**
-3. Set a **Redirect URI** (e.g. `https://example.com/callback`)
-4. Under "Users & Devices", authorize your Bouncie account
-5. Copy the **Authorization Code** from the device's expanded view
-
-### 3. Configure environment
-
-Set these environment variables:
-
-| Variable | Required | Description |
-|---|---|---|
-| `BOUNCIE_CLIENT_ID` | Yes | Your app's client ID |
-| `BOUNCIE_CLIENT_SECRET` | Yes | Your app's client secret |
-| `BOUNCIE_REDIRECT_URI` | Yes | Redirect URI used during app registration |
-| `BOUNCIE_AUTH_CODE` | One of these | Authorization code (exchanged for token automatically) |
-| `BOUNCIE_ACCESS_TOKEN` | One of these | Pre-obtained access token (skip OAuth exchange) |
-
-### 4. Add to your MCP client
-
-#### Claude Desktop / Claude Code
-
-Add to your MCP settings (`claude_desktop_config.json` or `.claude/settings.json`):
+Add to Claude Desktop or Claude Code MCP settings:
 
 ```json
 {
@@ -68,29 +48,57 @@ Add to your MCP settings (`claude_desktop_config.json` or `.claude/settings.json
 }
 ```
 
+### Remote (HTTP) mode with Docker
+
+```bash
+cp .env.example .env  # fill in your credentials
+docker compose up -d
+```
+
+The server exposes:
+- `/mcp` — MCP endpoint (Bearer token auth)
+- `/authorize` — OAuth login page
+- `/health` — health check
+- `/.well-known/oauth-authorization-server` — RFC 8414 metadata
+
+## Bouncie API Credentials
+
+1. Register at [bouncie.dev](https://www.bouncie.dev) and create an app
+2. Note your **Client ID** and **Client Secret**
+3. Set a **Redirect URI**
+4. Under "Users & Devices", authorize your account
+5. Copy the **Authorization Code** from the device's expanded view
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOUNCIE_CLIENT_ID` | Yes | Bouncie app client ID |
+| `BOUNCIE_CLIENT_SECRET` | Yes | Bouncie app client secret |
+| `BOUNCIE_REDIRECT_URI` | Yes | Redirect URI from app registration |
+| `BOUNCIE_AUTH_CODE` | One of these | Authorization code (auto-exchanged for token) |
+| `BOUNCIE_ACCESS_TOKEN` | One of these | Pre-obtained access token |
+| `PUBLIC_URL` | HTTP mode | Public URL (e.g. `https://bouncie.example.com`) |
+| `OAUTH_PASSWORD` | HTTP mode | Password for the OAuth authorization form |
+| `TOKEN_TTL_HOURS` | No | OAuth token lifetime, default 24 |
+| `PORT` | No | HTTP server port, default 3000 |
+
 ## Tools
 
 ### `get_vehicles`
 
-List all vehicles on the account.
+List all vehicles on the account with live stats.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `vin` | string (optional) | Filter by VIN |
 | `imei` | string (optional) | Filter by device IMEI |
 
-**Returns:** Array of vehicles with model info, VIN, IMEI, nickname, and live stats (location, speed, fuel, odometer, engine status, battery, MIL/DTCs).
+Returns: vehicle info (make/model/year, VIN, IMEI, nickname) and live stats (GPS location, speed, fuel level, odometer, engine running status, battery, check engine light, DTCs).
 
 ### `get_vehicle`
 
-Get a single vehicle by VIN or IMEI.
-
-| Parameter | Type | Description |
-|---|---|---|
-| `vin` | string (optional) | Vehicle VIN |
-| `imei` | string (optional) | Device IMEI |
-
-At least one identifier is required.
+Get a single vehicle by VIN or IMEI. At least one identifier required.
 
 ### `get_trips`
 
@@ -102,50 +110,50 @@ Get trip history for a vehicle.
 | `starts_after` | string (optional) | ISO date — trips starting after this time |
 | `ends_before` | string (optional) | ISO date — trips ending before this time |
 | `gps_format` | `"polyline"` \| `"geojson"` (optional) | GPS data format (default: polyline) |
-| `transaction_id` | string (optional) | Fetch a specific trip |
+| `transaction_id` | string (optional) | Fetch a specific trip by transaction ID |
 
-> **Note:** The date window (`starts_after` to `ends_before`) must be no longer than 1 week. Defaults to the last 7 days if not specified.
+> Date window max 1 week. Defaults to last 7 days.
 
-**Returns:** Array of trips with distance, duration, average/max speed, fuel consumed, hard braking/acceleration counts, odometer readings, and GPS trace.
+Returns: distance, duration, average/max speed, fuel consumed, hard braking/acceleration counts, odometer, GPS trace.
 
 ### `get_user`
 
 Get the authenticated user's profile.
 
-No parameters.
+## Timestamps
+
+All timestamps from the Bouncie API are in **UTC**. Each vehicle/trip includes a timezone offset field (`localTimeZone` or `timeZone`, e.g. `"-0500"`) for local time conversion.
 
 ## Development
 
 ```bash
 npm run dev        # Run with tsx (hot reload)
 npm run build      # Compile TypeScript
-npm test           # Run tests
-npm run test:watch # Watch mode
+npm test           # Run tests (21 tests)
 npm run lint       # Type check
 ```
 
-## API Reference
+## Architecture
 
-This server wraps the [Bouncie REST API v1](https://docs.bouncie.dev):
+- `src/index.ts` — stdio transport entry point
+- `src/http.ts` — HTTP/Express entry point with OAuth
+- `src/server.ts` — MCP tool definitions
+- `src/api.ts` — Bouncie REST API client
+- `src/oauth.ts` — OAuth 2.0 + PKCE implementation
+- `src/types.ts` — TypeScript types for vehicles, trips, and webhook events
 
-- **Base URL:** `https://api.bouncie.dev/v1`
-- **Auth:** `https://auth.bouncie.com/oauth/token`
-- **Endpoints:** `/vehicles`, `/trips`, `/user`
+## Bouncie Webhook Events
 
-## Webhook Event Types
+The Bouncie API also supports webhooks (documented here for reference):
 
-Bouncie also supports webhooks (not exposed via this MCP server, but documented here for reference):
-
-| Event Type | Description |
+| Event | Description |
 |---|---|
-| `connect` | Device plugged in |
-| `disconnect` | Device unplugged |
+| `connect` / `disconnect` | Device plugged in / unplugged |
 | `battery` | Battery status change (normal/critical) |
 | `mil` | Check engine light on/off with DTC codes |
-| `tripStart` | Trip begins — includes odometer |
-| `tripEnd` | Trip ends — includes odometer, fuel consumed |
-| `tripMetrics` | Trip summary — distance, time, speeds, braking/acceleration |
-| `tripData` | Real-time GPS breadcrumbs during trip |
+| `tripStart` / `tripEnd` | Trip begins/ends with odometer, fuel consumed |
+| `tripMetrics` | Trip summary — distance, speeds, braking/acceleration |
+| `tripData` | Real-time GPS breadcrumbs during a trip |
 
 ## License
 

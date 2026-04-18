@@ -52,6 +52,13 @@ export class BouncieClient {
   }
 
   async authenticate(): Promise<string> {
+    if (!this.config.clientId || !this.config.clientSecret || !this.config.redirectUri) {
+      throw new BouncieApiError(
+        "Cannot authenticate: clientId, clientSecret, and redirectUri are required for authorization code exchange.",
+        401,
+      );
+    }
+
     const body = new URLSearchParams({
       client_id: this.config.clientId,
       client_secret: this.config.clientSecret,

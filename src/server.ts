@@ -3,24 +3,6 @@ import { z } from "zod";
 import { BouncieClient, BouncieApiError } from "./api.js";
 import type { GpsFormat } from "./types.js";
 
-function getEnvOrThrow(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
-
-function createClient(): BouncieClient {
-  return new BouncieClient({
-    clientId: getEnvOrThrow("BOUNCIE_CLIENT_ID"),
-    clientSecret: getEnvOrThrow("BOUNCIE_CLIENT_SECRET"),
-    redirectUri: getEnvOrThrow("BOUNCIE_REDIRECT_URI"),
-    authorizationCode: process.env.BOUNCIE_AUTH_CODE,
-    accessToken: process.env.BOUNCIE_ACCESS_TOKEN,
-  });
-}
-
 function formatError(error: unknown): string {
   if (error instanceof BouncieApiError) {
     return `Bouncie API error (${error.status}): ${error.message}${error.body ? `\n${error.body}` : ""}`;
@@ -31,11 +13,31 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
-export function createServer(): McpServer {
+export interface ServerOptions {
+  /** Bouncie access token for this user's session */
+  bouncieAccessToken?: string;
+}
+
+export function createServer(options?: ServerOptions): McpServer {
   const server = new McpServer({
     name: "bouncie",
     version: "1.0.0",
   });
+
+  function createClient(): BouncieClient {
+    const token = options?.bouncieAccessToken;
+    if (!token) {
+      throw new Error(
+        "Not authenticated with Bouncie. Please complete the OAuth authorization flow first.",
+      );
+    }
+    return new BouncieClient({
+      clientId: "",
+      clientSecret: "",
+      redirectUri: "",
+      accessToken: token,
+    });
+  }
 
   server.tool(
     "get_vehicles",

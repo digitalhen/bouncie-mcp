@@ -1,7 +1,7 @@
 {
   "name": "bouncie-mcp",
   "version": "1.0.0",
-  "description": "MCP server for the Bouncie vehicle tracking API",
+  "description": "Model Context Protocol (MCP) server for Bouncie OBD2 GPS vehicle tracking — real-time location, trip history, diagnostics, and fuel data for Claude and AI assistants",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -9,8 +9,10 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "start": "node dist/http.js",
+    "start:stdio": "node dist/index.js",
+    "dev": "tsx src/http.ts",
+    "dev:stdio": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"
@@ -18,9 +20,15 @@
   "keywords": [
     "bouncie",
     "mcp",
+    "model-context-protocol",
     "vehicle",
     "obd2",
-    "tracking"
+    "gps",
+    "tracking",
+    "car",
+    "diagnostics",
+    "claude",
+    "ai"
   ],
   "license": "MIT",
   "dependencies": {

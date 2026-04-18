@@ -1,9 +1,9 @@
 // Bouncie API type definitions
 
 export interface BouncieConfig {
-  clientId: string;
-  clientSecret: string;
-  redirectUri: string;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
   authorizationCode?: string;
   accessToken?: string;
 }

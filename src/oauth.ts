@@ -1,5 +1,9 @@
 // ---------------------------------------------------------------------------
-// OAuth 2.0 — simple implementation for Claude.ai hosted MCP
+// OAuth 2.0 — Bouncie OAuth proxy for Claude.ai hosted MCP
+//
+// Instead of a password gate, users authorize with their own Bouncie account.
+// The MCP server acts as an OAuth provider to Claude.ai while proxying
+// authorization to Bouncie's OAuth under the hood.
 // ---------------------------------------------------------------------------
 
 import { Router } from "express";
@@ -16,11 +20,13 @@ interface AuthCode {
   codeChallenge?: string;
   codeChallengeMethod?: string;
   redirectUri: string;
+  bouncieAccessToken: string;
   expiresAt: number;
 }
 
 interface TokenRecord {
   clientId: string;
+  bouncieAccessToken: string;
   issuedAt: number;
   expiresAt: number;
 }
@@ -31,6 +37,16 @@ interface RegisteredClient {
   redirectUris: string[];
 }
 
+/** Pending Bouncie OAuth flow — maps our internal state to the original Claude.ai OAuth params */
+interface PendingBouncieAuth {
+  clientId: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+  redirectUri: string;
+  mcpState?: string;
+  createdAt: number;
+}
+
 interface StoreData {
   accessTokens: Record<string, TokenRecord>;
   registeredClients: Record<string, RegisteredClient>;
@@ -39,6 +55,7 @@ interface StoreData {
 const authCodes = new Map<string, AuthCode>();
 const accessTokens = new Map<string, TokenRecord>();
 const registeredClients = new Map<string, RegisteredClient>();
+const pendingBouncieAuths = new Map<string, PendingBouncieAuth>();
 
 let storePath = "";
 
@@ -86,11 +103,17 @@ setInterval(() => {
       changed = true;
     }
   }
+  // Clean up expired pending Bouncie auths (10 min TTL)
+  for (const [state, data] of pendingBouncieAuths) {
+    if (now - data.createdAt > 10 * 60 * 1000) {
+      pendingBouncieAuths.delete(state);
+    }
+  }
   if (changed) saveStore();
 }, 60_000);
 
 // ---------------------------------------------------------------------------
-// Token validation — used by MCP auth middleware
+// Token validation & Bouncie token lookup — used by MCP auth middleware
 // ---------------------------------------------------------------------------
 
 export function isValidToken(token: string): boolean {
@@ -101,6 +124,17 @@ export function isValidToken(token: string): boolean {
     return false;
   }
   return true;
+}
+
+/** Look up the Bouncie access token associated with an MCP bearer token */
+export function getBouncieToken(mcpToken: string): string | null {
+  const record = accessTokens.get(mcpToken);
+  if (!record) return null;
+  if (record.expiresAt < Date.now()) {
+    accessTokens.delete(mcpToken);
+    return null;
+  }
+  return record.bouncieAccessToken;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,8 +156,44 @@ function esc(str: unknown): string {
 
 export interface OAuthConfig {
   publicUrl: string;
-  oauthPassword: string;
   tokenTtlMs: number;
+  bouncieClientId: string;
+  bouncieClientSecret: string;
+}
+
+// ---------------------------------------------------------------------------
+// Bouncie OAuth helpers
+// ---------------------------------------------------------------------------
+
+const BOUNCIE_AUTH_DIALOG = "https://auth.bouncie.com/dialog/authorize";
+const BOUNCIE_TOKEN_URL = "https://auth.bouncie.com/oauth/token";
+
+async function exchangeBouncieCode(
+  code: string,
+  config: OAuthConfig,
+): Promise<string> {
+  const callbackUrl = `${config.publicUrl}/auth/bouncie/callback`;
+  const body = new URLSearchParams({
+    client_id: config.bouncieClientId,
+    client_secret: config.bouncieClientSecret,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: callbackUrl,
+  });
+
+  const res = await fetch(BOUNCIE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Bouncie token exchange failed (${res.status}): ${text}`);
+  }
+
+  const data = (await res.json()) as { access_token: string };
+  return data.access_token;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,59 +241,94 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
     });
   });
 
-  // Authorization GET — show password form
+  // Authorization GET — redirect to Bouncie OAuth instead of showing a password form
   router.get("/authorize", (req, res) => {
-    const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
+    const {
+      client_id,
+      redirect_uri,
+      state,
+      code_challenge,
+      code_challenge_method,
+      response_type,
+    } = req.query as Record<string, string>;
 
     if (response_type !== "code") {
       res.status(400).send("Unsupported response_type");
       return;
     }
 
-    res.type("html").send(renderAuthForm({
-      clientId: esc(client_id),
-      redirectUri: esc(redirect_uri),
-      state: esc(state),
-      codeChallenge: esc(code_challenge),
-      codeChallengeMethod: esc(code_challenge_method),
-    }));
-  });
-
-  // Authorization POST — validate password, issue code
-  router.post("/authorize", (req, res) => {
-    const { client_id, redirect_uri, state, code_challenge, code_challenge_method, password } = req.body;
-
-    if (password !== config.oauthPassword) {
-      console.warn("[oauth] Failed authorization attempt");
-      res.type("html").send(renderAuthForm({
-        clientId: esc(client_id),
-        redirectUri: esc(redirect_uri),
-        state: esc(state),
-        codeChallenge: esc(code_challenge),
-        codeChallengeMethod: esc(code_challenge_method),
-        error: "Wrong password. Try again.",
-      }));
-      return;
-    }
-
-    const code = crypto.randomBytes(32).toString("hex");
-    authCodes.set(code, {
+    // Generate internal state for the Bouncie OAuth flow
+    const internalState = crypto.randomBytes(16).toString("hex");
+    pendingBouncieAuths.set(internalState, {
       clientId: client_id,
       codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method,
       redirectUri: redirect_uri,
-      expiresAt: Date.now() + 10 * 60 * 1000,
+      mcpState: state,
+      createdAt: Date.now(),
     });
 
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set("code", code);
-    if (state) redirectUrl.searchParams.set("state", state);
+    // Redirect user to Bouncie's authorization page
+    const bouncieAuthUrl = new URL(BOUNCIE_AUTH_DIALOG);
+    bouncieAuthUrl.searchParams.set("client_id", config.bouncieClientId);
+    bouncieAuthUrl.searchParams.set("redirect_uri", `${config.publicUrl}/auth/bouncie/callback`);
+    bouncieAuthUrl.searchParams.set("response_type", "code");
+    bouncieAuthUrl.searchParams.set("state", internalState);
 
-    console.log(`[oauth] Authorization code issued for client ${client_id}`);
-    res.redirect(302, redirectUrl.toString());
+    res.redirect(302, bouncieAuthUrl.toString());
   });
 
-  // Token endpoint — exchange code for access token
+  // Bouncie OAuth callback — exchange Bouncie code, issue MCP auth code, redirect back to Claude.ai
+  router.get("/auth/bouncie/callback", async (req, res) => {
+    const { code, state, error } = req.query as Record<string, string>;
+
+    if (error) {
+      res.status(400).type("html").send(
+        `<html><body><h1>Authorization Failed</h1><p>Bouncie returned an error: ${esc(error)}</p></body></html>`,
+      );
+      return;
+    }
+
+    const pending = pendingBouncieAuths.get(state);
+    if (!pending) {
+      res.status(400).type("html").send(
+        `<html><body><h1>Invalid State</h1><p>OAuth state is invalid or expired. Please try again.</p></body></html>`,
+      );
+      return;
+    }
+    pendingBouncieAuths.delete(state);
+
+    try {
+      // Exchange Bouncie auth code for Bouncie access token
+      const bouncieAccessToken = await exchangeBouncieCode(code, config);
+
+      // Issue an MCP authorization code that carries the Bouncie token
+      const mcpCode = crypto.randomBytes(32).toString("hex");
+      authCodes.set(mcpCode, {
+        clientId: pending.clientId,
+        codeChallenge: pending.codeChallenge,
+        codeChallengeMethod: pending.codeChallengeMethod,
+        redirectUri: pending.redirectUri,
+        bouncieAccessToken,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+
+      // Redirect back to Claude.ai with the MCP auth code
+      const redirectUrl = new URL(pending.redirectUri);
+      redirectUrl.searchParams.set("code", mcpCode);
+      if (pending.mcpState) redirectUrl.searchParams.set("state", pending.mcpState);
+
+      console.log(`[oauth] Bouncie authorization complete for client ${pending.clientId}`);
+      res.redirect(302, redirectUrl.toString());
+    } catch (err: any) {
+      console.error(`[oauth] Bouncie token exchange failed: ${err.message}`);
+      res.status(500).type("html").send(
+        `<html><body><h1>Authorization Failed</h1><p>Failed to complete Bouncie authorization: ${esc(err.message)}</p></body></html>`,
+      );
+    }
+  });
+
+  // Token endpoint — exchange MCP auth code for MCP access token
   router.post("/token", (req, res) => {
     const { grant_type, code, code_verifier, redirect_uri } = req.body;
 
@@ -263,10 +368,12 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
 
+    // Issue MCP access token that maps to the user's Bouncie token
     const token = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
     accessTokens.set(token, {
       clientId: stored.clientId,
+      bouncieAccessToken: stored.bouncieAccessToken,
       issuedAt: now,
       expiresAt: now + config.tokenTtlMs,
     });
@@ -283,43 +390,4 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
   });
 
   return router;
-}
-
-// ---------------------------------------------------------------------------
-// Auth form template
-// ---------------------------------------------------------------------------
-
-function renderAuthForm(opts: {
-  clientId: string;
-  redirectUri: string;
-  state: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  error?: string;
-}): string {
-  const errorHtml = opts.error ? `<p class="error">${esc(opts.error)}</p>` : "";
-  return `<!DOCTYPE html>
-<html><head><title>Bouncie MCP — Authorize</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  body { font-family: system-ui; max-width: 400px; margin: 80px auto; padding: 0 20px; }
-  h1 { font-size: 1.3em; }
-  input { display: block; width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }
-  button { width: 100%; padding: 12px; background: #0066cc; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
-  button:hover { background: #0052a3; }
-  .error { color: red; margin-bottom: 10px; }
-</style></head><body>
-<h1>Authorize Bouncie MCP</h1>
-<p>Enter your password to allow Claude to access your Bouncie vehicle data.</p>
-${errorHtml}
-<form method="POST" action="/authorize">
-  <input type="hidden" name="client_id" value="${opts.clientId}">
-  <input type="hidden" name="redirect_uri" value="${opts.redirectUri}">
-  <input type="hidden" name="state" value="${opts.state}">
-  <input type="hidden" name="code_challenge" value="${opts.codeChallenge}">
-  <input type="hidden" name="code_challenge_method" value="${opts.codeChallengeMethod}">
-  <input type="password" name="password" placeholder="Password" required autofocus>
-  <button type="submit">Authorize</button>
-</form>
-</body></html>`;
 }
