@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="branding/logo.png" alt="Bouncie Copilot" width="480"/>
+</p>
+
 # Bouncie MCP Server
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the [Bouncie](https://bouncie.com) OBD2 vehicle tracking API. Give Claude, ChatGPT, or any MCP-compatible AI assistant real-time access to your vehicle data — location, trips, diagnostics, fuel level, and more.
@@ -18,8 +22,9 @@ Connect your Bouncie GPS tracker to AI. Ask natural language questions like:
 - **Trip history & analytics** — distance, duration, average/max speed, fuel consumed, hard braking & acceleration counts, GPS traces (polyline or GeoJSON)
 - **Vehicle diagnostics** — check engine light (MIL) status, OBD2 diagnostic trouble codes (DTCs), battery health
 - **Vehicle info** — make, model, year, VIN, engine, odometer, fuel level
-- **OAuth 2.0 + PKCE** — secure authentication for hosted/remote deployments (compatible with Claude.ai)
-- **Docker + Cloudflare Tunnel ready** — deploy anywhere with HTTPS
+- **Multi-user OAuth** — HTTP mode proxies Claude.ai's OAuth to Bouncie's, so each user authorizes with their own Bouncie account
+- **Stdio + HTTP modes** — run locally with a pre-issued access token, or host centrally for multiple users
+- **Docker-ready** — deploy anywhere with HTTPS
 
 ## Quick Start
 
@@ -38,15 +43,14 @@ Add to Claude Desktop or Claude Code MCP settings:
       "command": "node",
       "args": ["/path/to/bouncie-mcp/dist/index.js"],
       "env": {
-        "BOUNCIE_CLIENT_ID": "your-client-id",
-        "BOUNCIE_CLIENT_SECRET": "your-client-secret",
-        "BOUNCIE_REDIRECT_URI": "https://example.com/callback",
         "BOUNCIE_ACCESS_TOKEN": "your-access-token"
       }
     }
   }
 }
 ```
+
+Stdio mode uses a pre-obtained Bouncie access token — no OAuth flow. Use HTTP mode for multi-user deployments.
 
 ### Remote (HTTP) mode with Docker
 
@@ -57,30 +61,37 @@ docker compose up -d
 
 The server exposes:
 - `/mcp` — MCP endpoint (Bearer token auth)
-- `/authorize` — OAuth login page
-- `/health` — health check
+- `/authorize` — kicks off the OAuth flow, redirects the user to Bouncie
+- `/callback` — Bouncie's OAuth redirect target
+- `/token` — token exchange endpoint for MCP clients
+- `/register` — RFC 7591 dynamic client registration
 - `/.well-known/oauth-authorization-server` — RFC 8414 metadata
+- `/health` — health check
 
-## Bouncie API Credentials
+## Bouncie App Setup
 
 1. Register at [bouncie.dev](https://www.bouncie.dev) and create an app
 2. Note your **Client ID** and **Client Secret**
-3. Set a **Redirect URI**
-4. Under "Users & Devices", authorize your account
-5. Copy the **Authorization Code** from the device's expanded view
+3. Set the **Redirect URL** to `{PUBLIC_URL}/callback` (e.g. `https://bouncie.example.com/callback`)
+
+That's all the portal work — users authorize individually through the OAuth flow when they connect via Claude.ai.
 
 ## Environment Variables
+
+### Stdio mode (single-user)
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOUNCIE_ACCESS_TOKEN` | Yes | Pre-obtained Bouncie access token |
+
+### HTTP mode (multi-user)
 
 | Variable | Required | Description |
 |---|---|---|
 | `BOUNCIE_CLIENT_ID` | Yes | Bouncie app client ID |
 | `BOUNCIE_CLIENT_SECRET` | Yes | Bouncie app client secret |
-| `BOUNCIE_REDIRECT_URI` | Yes | Redirect URI from app registration |
-| `BOUNCIE_AUTH_CODE` | One of these | Authorization code (auto-exchanged for token) |
-| `BOUNCIE_ACCESS_TOKEN` | One of these | Pre-obtained access token |
-| `PUBLIC_URL` | HTTP mode | Public URL (e.g. `https://bouncie.example.com`) |
-| `OAUTH_PASSWORD` | HTTP mode | Password for the OAuth authorization form |
-| `TOKEN_TTL_HOURS` | No | OAuth token lifetime, default 24 |
+| `PUBLIC_URL` | Yes | Public URL (e.g. `https://bouncie.example.com`); Bouncie app's redirect URL must be `{PUBLIC_URL}/callback` |
+| `TOKEN_TTL_HOURS` | No | MCP token lifetime in hours, default 24 |
 | `PORT` | No | HTTP server port, default 3000 |
 
 ## Tools
@@ -139,7 +150,7 @@ npm run lint       # Type check
 - `src/http.ts` — HTTP/Express entry point with OAuth
 - `src/server.ts` — MCP tool definitions
 - `src/api.ts` — Bouncie REST API client
-- `src/oauth.ts` — OAuth 2.0 + PKCE implementation
+- `src/oauth.ts` — OAuth provider that proxies Claude.ai's OAuth to Bouncie's (PKCE supported)
 - `src/types.ts` — TypeScript types for vehicles, trips, and webhook events
 
 ## Bouncie Webhook Events
