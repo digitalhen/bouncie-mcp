@@ -54,7 +54,7 @@ npm run lint       # tsc --noEmit
 - `PORT` — Listen port (default: `3000`)
 - `TOKEN_TTL_HOURS` — MCP token lifetime in hours (default: `24`)
 
-The Bouncie OAuth redirect URI registered in your Bouncie app must be `{PUBLIC_URL}/auth/bouncie/callback`.
+The Bouncie OAuth redirect URI registered in your Bouncie app must be `{PUBLIC_URL}/callback`.
 
 ### Stdio mode (single-user)
 - `BOUNCIE_ACCESS_TOKEN` — Pre-obtained Bouncie access token
@@ -65,7 +65,7 @@ The Bouncie OAuth redirect URI registered in your Bouncie app must be `{PUBLIC_U
 2. Claude.ai registers as a client via `/register`
 3. User is redirected to `/authorize` → server redirects to Bouncie's OAuth
 4. User authorizes with their Bouncie account
-5. Bouncie redirects to `/auth/bouncie/callback` → server exchanges code for Bouncie token
+5. Bouncie redirects to `/callback` → server exchanges code for Bouncie token
 6. Server issues an MCP auth code, redirects back to Claude.ai
 7. Claude.ai exchanges the MCP code for an MCP access token at `/token`
 8. Each MCP access token is tied to the user's Bouncie access token

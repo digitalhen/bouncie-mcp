@@ -172,7 +172,7 @@ async function exchangeBouncieCode(
   code: string,
   config: OAuthConfig,
 ): Promise<string> {
-  const callbackUrl = `${config.publicUrl}/auth/bouncie/callback`;
+  const callbackUrl = `${config.publicUrl}/callback`;
   const body = new URLSearchParams({
     client_id: config.bouncieClientId,
     client_secret: config.bouncieClientSecret,
@@ -271,7 +271,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
     // Redirect user to Bouncie's authorization page
     const bouncieAuthUrl = new URL(BOUNCIE_AUTH_DIALOG);
     bouncieAuthUrl.searchParams.set("client_id", config.bouncieClientId);
-    bouncieAuthUrl.searchParams.set("redirect_uri", `${config.publicUrl}/auth/bouncie/callback`);
+    bouncieAuthUrl.searchParams.set("redirect_uri", `${config.publicUrl}/callback`);
     bouncieAuthUrl.searchParams.set("response_type", "code");
     bouncieAuthUrl.searchParams.set("state", internalState);
 
@@ -279,7 +279,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
   });
 
   // Bouncie OAuth callback — exchange Bouncie code, issue MCP auth code, redirect back to Claude.ai
-  router.get("/auth/bouncie/callback", async (req, res) => {
+  router.get("/callback", async (req, res) => {
     const { code, state, error } = req.query as Record<string, string>;
 
     if (error) {
