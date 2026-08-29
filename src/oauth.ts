@@ -281,6 +281,11 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       response_type,
     } = req.query as Record<string, string>;
 
+    console.log(
+      `[oauth] /authorize client=${client_id} redirect_uri=${redirect_uri} ` +
+        `state=${state ? "present" : "MISSING"} pkce=${code_challenge_method || "none"}`,
+    );
+
     if (response_type !== "code") {
       res.status(400).send("Unsupported response_type");
       return;
@@ -347,7 +352,10 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       redirectUrl.searchParams.set("code", mcpCode);
       if (pending.mcpState) redirectUrl.searchParams.set("state", pending.mcpState);
 
-      console.log(`[oauth] Bouncie authorization complete for client ${pending.clientId}`);
+      console.log(
+        `[oauth] Bouncie authorization complete for client ${pending.clientId}; ` +
+          `redirecting to ${pending.redirectUri} state=${pending.mcpState ? "present" : "MISSING"}`,
+      );
       res.redirect(302, redirectUrl.toString());
     } catch (err: any) {
       console.error(`[oauth] Bouncie token exchange failed: ${err.message}`);
@@ -361,15 +369,29 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
   router.post("/token", (req, res) => {
     const { grant_type, code, code_verifier, redirect_uri } = req.body;
 
+    const reject = (error: string, description: string) => {
+      console.warn(`[oauth] /token rejected: ${error} — ${description}`);
+      res.status(400).json({ error, error_description: description });
+    };
+
+    console.log(
+      `[oauth] /token grant_type=${grant_type} code=${code ? "present" : "MISSING"} ` +
+        `verifier=${code_verifier ? "present" : "MISSING"} redirect_uri=${redirect_uri}`,
+    );
+
     if (grant_type !== "authorization_code") {
-      res.status(400).json({ error: "unsupported_grant_type" });
+      reject("unsupported_grant_type", `grant_type was ${grant_type}`);
       return;
     }
 
     const stored = authCodes.get(code);
-    if (!stored || stored.expiresAt < Date.now()) {
+    if (!stored) {
+      reject("invalid_grant", `no such authorization code (${authCodes.size} outstanding)`);
+      return;
+    }
+    if (stored.expiresAt < Date.now()) {
       authCodes.delete(code);
-      res.status(400).json({ error: "invalid_grant" });
+      reject("invalid_grant", "authorization code expired");
       return;
     }
 
@@ -387,13 +409,13 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       const a = Buffer.from(computedChallenge, "utf8");
       const b = Buffer.from(stored.codeChallenge, "utf8");
       if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-        res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+        reject("invalid_grant", `PKCE verification failed (method ${stored.codeChallengeMethod})`);
         return;
       }
     }
 
     if (redirect_uri && redirect_uri !== stored.redirectUri) {
-      res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
+      reject("invalid_grant", `redirect_uri mismatch: got ${redirect_uri}, stored ${stored.redirectUri}`);
       return;
     }
 
