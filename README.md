@@ -24,6 +24,7 @@ Connect your Bouncie GPS tracker to AI. Ask natural language questions like:
 - **Vehicle info** — make, model, year, VIN, engine, odometer, fuel level
 - **Multi-user OAuth** — HTTP mode proxies Claude.ai's OAuth to Bouncie's, so each user authorizes with their own Bouncie account
 - **Stdio + HTTP modes** — run locally with a pre-issued access token, or host centrally for multiple users
+- **Stateless — safe behind a load balancer** — no session or token state is held in memory or on disk, so any instance can serve any request
 - **Docker-ready** — deploy anywhere with HTTPS
 
 ## Quick Start
@@ -65,8 +66,12 @@ The server exposes:
 - `/callback` — Bouncie's OAuth redirect target
 - `/token` — token exchange endpoint for MCP clients
 - `/register` — RFC 7591 dynamic client registration
-- `/.well-known/oauth-authorization-server` — RFC 8414 metadata
+- `/.well-known/oauth-authorization-server` — RFC 8414 authorization server metadata
+- `/.well-known/oauth-protected-resource` — RFC 9728 protected resource metadata
 - `/health` — health check
+
+Both `.well-known` documents are also served under a `/mcp` suffix, which is where
+clients probe when the resource has a path component.
 
 ## Bouncie App Setup
 
@@ -91,7 +96,8 @@ That's all the portal work — users authorize individually through the OAuth fl
 | `BOUNCIE_CLIENT_ID` | Yes | Bouncie app client ID |
 | `BOUNCIE_CLIENT_SECRET` | Yes | Bouncie app client secret |
 | `PUBLIC_URL` | Yes | Public URL (e.g. `https://bouncie.example.com`); Bouncie app's redirect URL must be `{PUBLIC_URL}/callback` |
-| `TOKEN_TTL_HOURS` | No | MCP token lifetime in hours, default 24 |
+| `TOKEN_TTL_HOURS` | No | MCP access token lifetime in hours, default 24 |
+| `TOKEN_SECRET` | No | Key material for sealing tokens. Defaults to deriving from `BOUNCIE_CLIENT_SECRET`. Set it explicitly if you run multiple instances and want token lifetime decoupled from client secret rotation — see [Running more than one instance](#running-more-than-one-instance) |
 | `PORT` | No | HTTP server port, default 3000 |
 
 ## Tools
@@ -152,6 +158,42 @@ npm run lint       # Type check
 - `src/api.ts` — Bouncie REST API client
 - `src/oauth.ts` — OAuth provider that proxies Claude.ai's OAuth to Bouncie's (PKCE supported)
 - `src/types.ts` — TypeScript types for vehicles, trips, and webhook events
+
+### Running more than one instance
+
+This server holds **no state** — not in memory, not on disk. That is a deliberate
+design constraint, not an incidental property, because the reference deployment
+runs two instances behind a load balancer that shares nothing between them.
+
+Everything the server would otherwise need to remember is carried inside the
+values it hands out, sealed with AES-256-GCM:
+
+| Value | Carries | Lifetime |
+|---|---|---|
+| Bouncie `state` parameter | the pending authorization (client, PKCE challenge, redirect URI, client's own state) | 10 min |
+| MCP authorization code | Bouncie access token, PKCE challenge, redirect URI | 10 min |
+| MCP access token | Bouncie access token | `TOKEN_TTL_HOURS`, default 24h |
+| MCP refresh token | Bouncie access token | 30 days |
+
+Each blob carries a purpose label and an expiry, and is rejected if either fails.
+The sealing key is derived via HKDF from `TOKEN_SECRET`, or from
+`BOUNCIE_CLIENT_SECRET` when that is unset — a value every instance already
+shares, so a multi-instance deployment needs no extra configuration.
+
+The MCP transport is stateless for the same reason: a session pinned to one
+process breaks as soon as the next request lands on another instance. `GET` and
+`DELETE /mcp` therefore return 405, and an `mcp-session-id` header from a
+client's earlier connection is ignored rather than rejected.
+
+For the debugging history behind this design, see
+[docs/oauth-debugging-notes.md](docs/oauth-debugging-notes.md).
+
+**Two consequences worth knowing:**
+
+- Rotating `BOUNCIE_CLIENT_SECRET` invalidates every outstanding MCP token, since
+  the sealing key derives from it. Set `TOKEN_SECRET` explicitly to decouple them.
+- Individual tokens cannot be revoked, because nothing records that they exist.
+  Rotating the sealing key revokes all of them at once.
 
 ## Bouncie Webhook Events
 
