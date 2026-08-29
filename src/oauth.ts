@@ -319,7 +319,10 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       scope,
     } = req.query as Record<string, string>;
 
-    console.log(`[oauth] /authorize query=${JSON.stringify(req.query)}`);
+    console.log(
+      `[oauth] /authorize client=${client_id} scope=${scope || "none"} ` +
+        `pkce=${code_challenge_method || "none"}`,
+    );
 
     if (response_type !== "code") {
       res.status(400).send("Unsupported response_type");
@@ -413,13 +416,6 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       console.warn(`[oauth] /token rejected: ${error} — ${description}`);
       res.status(400).json({ error, error_description: description });
     };
-
-    const redacted = Object.fromEntries(
-      Object.entries(req.body || {}).map(([k, v]) =>
-        /secret|verifier|code|token/i.test(k) ? [k, "<present>"] : [k, v],
-      ),
-    );
-    console.log(`[oauth] /token body=${JSON.stringify(redacted)}`);
 
     // Refresh grant — hand back a new access token for the same Bouncie session
     if (grant_type === "refresh_token") {

@@ -49,16 +49,9 @@ app.use(createOAuthRouter({
 const RESOURCE_METADATA_URL = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
 
 app.use("/mcp", (req, res, next) => {
-  console.log(
-    `[mcp] ${req.method} /mcp session=${req.headers["mcp-session-id"] || "none"} ` +
-      `auth=${req.headers.authorization ? "present" : "MISSING"} ` +
-      `accept=${req.headers.accept || "none"}`,
-  );
-
   // The MCP auth spec requires 401s to point at the protected-resource metadata,
   // which is how the client discovers where to start the OAuth flow.
   const challenge = (error: string, description: string) => {
-    console.warn(`[mcp] 401 on ${req.method} /mcp: ${description}`);
     res.setHeader(
       "WWW-Authenticate",
       `Bearer resource_metadata="${RESOURCE_METADATA_URL}", error="${error}", error_description="${description}"`,
@@ -134,7 +127,6 @@ app.get("/mcp", async (req, res) => {
   if (!sessionId || !transports.has(sessionId)) {
     // A client may open an SSE stream before it holds a session. That is not an
     // error worth failing the connection over — say the method isn't available.
-    console.warn(`[mcp] GET /mcp with no live session (${sessionId || "none"}) — 405`);
     res.setHeader("Allow", "POST, DELETE");
     res.status(405).json({ error: "Method Not Allowed" });
     return;
@@ -145,7 +137,6 @@ app.get("/mcp", async (req, res) => {
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports.has(sessionId)) {
-    console.warn(`[mcp] DELETE /mcp with no live session (${sessionId || "none"})`);
     res.status(404).json({ error: "Session not found" });
     return;
   }
