@@ -97,6 +97,7 @@ That's all the portal work — users authorize individually through the OAuth fl
 | `BOUNCIE_CLIENT_SECRET` | Yes | Bouncie app client secret |
 | `PUBLIC_URL` | Yes | Public URL (e.g. `https://bouncie.example.com`); Bouncie app's redirect URL must be `{PUBLIC_URL}/callback` |
 | `TOKEN_TTL_HOURS` | No | MCP access token lifetime in hours, default 24 |
+| `TRIP_THROTTLE_MS` | No | Delay between upstream `/trips` calls, default 250. A 13-month summary is ~63 windows, so a first uncached query takes roughly `windows × this`. Lower it if your client's timeout is tighter than Bouncie's rate limit demands |
 | `TOKEN_SECRET` | No | Key material for sealing tokens. Defaults to deriving from `BOUNCIE_CLIENT_SECRET`. Set it explicitly if you run multiple instances and want token lifetime decoupled from client secret rotation — see [Running more than one instance](#running-more-than-one-instance) |
 | `PORT` | No | HTTP server port, default 3000 |
 
@@ -119,19 +120,82 @@ Get a single vehicle by VIN or IMEI. At least one identifier required.
 
 ### `get_trips`
 
-Get trip history for a vehicle.
+Get individual trips for a vehicle.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `imei` | string | Device IMEI (required) |
 | `starts_after` | string (optional) | ISO date — trips starting after this time |
 | `ends_before` | string (optional) | ISO date — trips ending before this time |
-| `gps_format` | `"polyline"` \| `"geojson"` (optional) | GPS data format (default: polyline) |
+| `include_gps` | boolean (optional) | Include route geometry. **Default `false`** |
+| `gps_format` | `"polyline"` \| `"geojson"` (optional) | Format when `include_gps` is true (default: polyline) |
 | `transaction_id` | string (optional) | Fetch a specific trip by transaction ID |
 
 > Date window max 1 week. Defaults to last 7 days.
 
-Returns: distance, duration, average/max speed, fuel consumed, hard braking/acceleration counts, odometer, GPS trace.
+Returns: distance, duration, average/max speed, fuel consumed, hard braking/acceleration counts, odometer.
+
+**GPS is excluded unless you ask for it.** Route geometry is roughly 90% of a
+typical response, and most questions don't need it. The upstream API requires a
+`gpsFormat` on every request, so the server always sends one and strips the
+result when `include_gps` is false.
+
+For anything spanning more than a week, use `get_mileage_summary` rather than
+paging this tool.
+
+### `get_mileage_summary`
+
+Driving totals over any date range, bucketed by day, week, month, or year. This
+is the tool for trend questions — monthly series, before/after comparisons,
+year-over-year — which are impractical to answer by paging `get_trips`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `imei` | string | Device IMEI (required) |
+| `since` | string | Start of range, inclusive (`YYYY-MM-DD`) |
+| `until` | string | End of range, inclusive (`YYYY-MM-DD`) |
+| `period` | `"day"` \| `"week"` \| `"month"` \| `"year"` (optional) | Bucket size (default: month) |
+
+Returns a bucket per non-empty period plus a `totals` block, a `partial_trips`
+count, and `warnings` if any window could not be fetched. Contains no GPS data.
+
+| Field | Meaning |
+|---|---|
+| `trip_count` | Moving trips only |
+| `idle_events` | Zero-distance records — real fuel burn, counted separately so they don't inflate `trip_count` |
+| `distance_mi` / `distance_km` | Summed from each trip's exact `distance` |
+| `fuel_consumed_gal` | Includes fuel burned during idle events |
+| `duration_min` | Total trip time |
+| `driving_time_min` / `idle_time_min` | Moving vs. stopped, within trips |
+| `avg_speed_mph` / `avg_speed_kmh` | Distance over **moving** time, excluding idle |
+| `hard_braking` / `hard_acceleration` | Event counts |
+
+Notes on correctness:
+
+- Trips are bucketed by the vehicle's **local** date, using each trip's own
+  `timeZone` offset. A 9pm trip on the last day of a month stays in that month.
+- Distances are summed from the per-trip `distance` field, **never** by
+  differencing odometer readings — `startOdometer` is rounded to whole miles
+  while `endOdometer` is not, so consecutive trips disagree at the seam.
+- Trips still in progress are excluded from totals and reported in
+  `partial_trips`.
+- Both metric and imperial units are emitted, matching the shape of the e-bike
+  MCP's `mileage_over_time` so the two series can be compared field for field.
+
+### `get_odometer_at`
+
+The odometer reading at or before a given moment, from the most recent completed
+trip. Searches backward up to 30 days.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `imei` | string | Device IMEI (required) |
+| `date` | string | Point in time (`YYYY-MM-DD` or ISO datetime) |
+
+Returns `odometer_mi` (from the unrounded `endOdometer`), `reading_time`,
+`local_time`, `source_transaction_id`, and `gap_hours` — how far before the
+requested time the reading actually is, so you can judge whether it's close
+enough to be meaningful.
 
 ### `get_user`
 
@@ -146,7 +210,7 @@ All timestamps from the Bouncie API are in **UTC**. Each vehicle/trip includes a
 ```bash
 npm run dev        # Run with tsx (hot reload)
 npm run build      # Compile TypeScript
-npm test           # Run tests (21 tests)
+npm test           # Run tests (59 tests)
 npm run lint       # Type check
 ```
 
@@ -156,6 +220,7 @@ npm run lint       # Type check
 - `src/http.ts` — HTTP/Express entry point with OAuth
 - `src/server.ts` — MCP tool definitions
 - `src/api.ts` — Bouncie REST API client
+- `src/trips.ts` — trip range paging, caching, and aggregation
 - `src/oauth.ts` — OAuth provider that proxies Claude.ai's OAuth to Bouncie's (PKCE supported)
 - `src/types.ts` — TypeScript types for vehicles, trips, and webhook events
 

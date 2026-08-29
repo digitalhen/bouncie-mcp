@@ -73,19 +73,33 @@ export interface TripQuery {
   endsBefore?: string;
 }
 
+/**
+ * A trip still in progress omits its summary metrics and returns a null
+ * endOdometer, so everything the vehicle only knows once the trip ends is
+ * optional here. Note also that startOdometer is rounded while endOdometer is
+ * not — never derive distance by differencing odometer readings across trips.
+ */
 export interface Trip {
   transactionId: string;
   hardBrakingCount: number;
   hardAccelerationCount: number;
-  distance: number;
-  gps: string | GeoJSONData;
+  /** Miles. Absent while a trip is in progress; 0 for an idle event. */
+  distance?: number;
+  /** Omitted when the caller does not request GPS. */
+  gps?: string | GeoJSONData;
   startTime: string;
-  endTime: string;
+  /** Absent while a trip is in progress. */
+  endTime?: string;
+  /** Miles, rounded to the nearest whole mile. */
   startOdometer: number;
-  endOdometer: number;
-  averageSpeed: number;
-  maxSpeed: number;
-  fuelConsumed: number;
+  /** Miles, unrounded. Null while a trip is in progress. */
+  endOdometer?: number | null;
+  averageSpeed?: number;
+  /** Quantized to whole km/h upstream — round before displaying. */
+  maxSpeed?: number;
+  fuelConsumed?: number;
+  /** Seconds spent stopped during the trip. */
+  totalIdleDuration?: number;
   timeZone: string;
 }
 

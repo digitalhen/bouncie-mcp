@@ -2,7 +2,7 @@
 
 ## What this project is
 
-An MCP server that wraps the Bouncie vehicle tracking REST API (`https://api.bouncie.dev/v1`). It exposes 4 tools: `get_vehicles`, `get_vehicle`, `get_trips`, `get_user`.
+An MCP server that wraps the Bouncie vehicle tracking REST API (`https://api.bouncie.dev/v1`). It exposes 6 tools: `get_vehicles`, `get_vehicle`, `get_trips`, `get_user`, `get_mileage_summary`, and `get_odometer_at`.
 
 Supports two modes:
 - **HTTP mode** (`src/http.ts`) — multi-user, centrally hosted. Each user authenticates with their own Bouncie account via OAuth. Designed for Claude.ai remote MCP.
@@ -46,6 +46,7 @@ src/
   http.ts        — HTTP MCP entry point (multi-user, production)
   server.ts      — MCP tool definitions (shared by both entry points)
   api.ts         — BouncieClient class (REST API calls)
+  trips.ts       — trip range paging, chunk cache, local-time aggregation
   oauth.ts       — OAuth provider that proxies to Bouncie OAuth
   types.ts       — TypeScript types for all API objects and webhook events
   api.test.ts    — Unit tests for BouncieClient
@@ -65,7 +66,20 @@ npm run lint       # tsc --noEmit
 
 - **Auth:** POST `https://auth.bouncie.com/oauth/token` with `client_id`, `client_secret`, `grant_type=authorization_code`, `code`, `redirect_uri`. Returns `access_token`.
 - **Vehicles:** GET `/v1/vehicles?imei=&vin=` with `Authorization: <token>` header
-- **Trips:** GET `/v1/trips?imei=&startsAfter=&endsBefore=&gpsFormat=&transactionId=` — max 1 week window
+- **Trips:** GET `/v1/trips?imei=&startsAfter=&endsBefore=&gpsFormat=&transactionId=` — max 1 week window, `imei` required (not VIN)
+
+### Upstream quirks that constrain the code
+
+Verified empirically, not documented upstream. `src/trips.ts` depends on all of these:
+
+- **`gpsFormat` is required.** Omitting it returns 400 `gpsFormat is a required field`. The server always sends one and strips the result when the caller did not ask for GPS.
+- **In-progress trips return partial records** — no `endTime`, `distance`, speeds or `fuelConsumed`, and `endOdometer: null`. Never assume those fields exist; `isPartial()` guards every aggregate.
+- **`startOdometer` is rounded, `endOdometer` is not.** A trip ending at `28062.2` is followed by one starting at `28062`. **Never derive distance by differencing odometers** — sum the exact `distance` field. Odometer is a coarse cross-check only.
+- **Zero-distance trips are real idle events**, with nonzero `fuelConsumed` and large `totalIdleDuration`. Counted as `idle_events`, not `trip_count`, but their fuel and time still count.
+- **`maxSpeed` is quantized to whole km/h**, so values like `62.137100000000004` are unit conversions, not precision. Round before displaying.
+- **`transactionId` is `{imei}-{sequence}-{YYYYMM}`** and is the dedupe key across overlapping windows.
+
+Distances and odometer are **miles**; `totalIdleDuration` is **seconds**.
 - **User:** GET `/v1/user`
 
 ## Environment variables
