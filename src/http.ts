@@ -36,19 +36,6 @@ app.use((req, res, next) => {
   express.urlencoded({ extended: true })(req, res, next);
 });
 
-// Temporary: log every request reaching the app, with its status, so we can tell
-// a request that is rejected from one that never arrives at all.
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on("finish", () => {
-    console.log(
-      `[req] ${req.method} ${req.originalUrl.split("?")[0]} -> ${res.statusCode} ` +
-        `(${Date.now() - start}ms) ua=${(req.headers["user-agent"] || "none").slice(0, 60)}`,
-    );
-  });
-  next();
-});
-
 // OAuth routes — Bouncie OAuth proxy
 app.use(createOAuthRouter({
   publicUrl: PUBLIC_URL,
@@ -102,6 +89,11 @@ app.use("/mcp", (req, res, next) => {
 // ---------------------------------------------------------------------------
 
 app.post("/mcp", async (req, res) => {
+  // A client may still present a session id from an earlier connection. There
+  // are no sessions here, so ignore it rather than rejecting the request and
+  // making the client retry.
+  delete req.headers["mcp-session-id"];
+
   const bouncieAccessToken = (req as any).bouncieAccessToken as string | undefined;
   const mcpServer = createServer({ bouncieAccessToken: bouncieAccessToken ?? undefined });
   const transport = new StreamableHTTPServerTransport({
