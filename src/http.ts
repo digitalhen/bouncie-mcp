@@ -37,6 +37,19 @@ app.use((req, res, next) => {
   express.urlencoded({ extended: true })(req, res, next);
 });
 
+// Temporary: log every request reaching the app, with its status, so we can tell
+// a request that is rejected from one that never arrives at all.
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(
+      `[req] ${req.method} ${req.originalUrl.split("?")[0]} -> ${res.statusCode} ` +
+        `(${Date.now() - start}ms) ua=${(req.headers["user-agent"] || "none").slice(0, 60)}`,
+    );
+  });
+  next();
+});
+
 // OAuth routes — Bouncie OAuth proxy
 app.use(createOAuthRouter({
   publicUrl: PUBLIC_URL,
