@@ -130,6 +130,8 @@ Get individual trips for a vehicle.
 | `include_gps` | boolean (optional) | Include route geometry. **Default `false`** |
 | `gps_format` | `"polyline"` \| `"geojson"` (optional) | Format when `include_gps` is true (default: polyline) |
 | `transaction_id` | string (optional) | Fetch a specific trip by transaction ID |
+| `bbox` | object (optional) | Keep only trips touching this box — see [Geographic filtering](#geographic-filtering) |
+| `bbox_match` | `"intersects"` \| `"start"` \| `"end"` \| `"contains"` (optional) | How the trip must relate to the box (default: intersects) |
 
 > Date window max 1 week. Defaults to last 7 days.
 
@@ -155,6 +157,8 @@ year-over-year — which are impractical to answer by paging `get_trips`.
 | `since` | string | Start of range, inclusive (`YYYY-MM-DD`) |
 | `until` | string | End of range, inclusive (`YYYY-MM-DD`) |
 | `period` | `"day"` \| `"week"` \| `"month"` \| `"year"` (optional) | Bucket size (default: month) |
+| `bbox` | object (optional) | Restrict to trips touching this box — see [Geographic filtering](#geographic-filtering) |
+| `bbox_match` | `"intersects"` \| `"start"` \| `"end"` \| `"contains"` (optional) | How the trip must relate to the box (default: intersects) |
 
 Returns a bucket per non-empty period plus a `totals` block, a `partial_trips`
 count, and `warnings` if any window could not be fetched. Contains no GPS data.
@@ -181,6 +185,40 @@ Notes on correctness:
   `partial_trips`.
 - Both metric and imperial units are emitted, matching the shape of the e-bike
   MCP's `mileage_over_time` so the two series can be compared field for field.
+
+### Geographic filtering
+
+Both `get_trips` and `get_mileage_summary` accept a `bbox` to restrict results to
+a geographic area. Coordinates are decimal degrees (WGS84):
+
+```json
+{ "min_lat": 30.2, "min_lon": -97.8, "max_lat": 30.4, "max_lon": -97.6 }
+```
+
+`bbox_match` chooses what "in the box" means:
+
+| Mode | Matches when the trip |
+|---|---|
+| `intersects` (default) | passes through the box at any point |
+| `start` | began inside it |
+| `end` | finished inside it |
+| `contains` | stayed entirely within it |
+
+Three things are worth understanding before relying on this:
+
+- **Filtering forces GPS to be fetched.** A trip record carries no coordinates of
+  its own — position exists only inside `gps`. So a box filter always fetches and
+  decodes the route, then discards it again unless `include_gps` is set. Using
+  `bbox` therefore costs the full payload upstream even though the response stays
+  small, and it will be slower than an unfiltered query.
+- **A matched trip counts in full.** `get_mileage_summary` with a `bbox` includes
+  the *entire* distance and fuel of every matching trip, including the portion
+  driven outside the box. It answers "how much driving involved this area", not
+  "how many miles were driven inside this area". The response says so in its
+  `note`, and reports `excluded_by_bbox` and `unlocatable_trips` (trips with no
+  decodable route, which no box can match).
+- **Boxes crossing the antimeridian are rejected.** `min_lon` must be `<=`
+  `max_lon`; split such a query into two boxes.
 
 ### `get_odometer_at`
 

@@ -46,7 +46,7 @@ src/
   http.ts        — HTTP MCP entry point (multi-user, production)
   server.ts      — MCP tool definitions (shared by both entry points)
   api.ts         — BouncieClient class (REST API calls)
-  trips.ts       — trip range paging, chunk cache, local-time aggregation
+  trips.ts       — trip range paging, chunk cache, local-time aggregation, bbox filtering
   oauth.ts       — OAuth provider that proxies to Bouncie OAuth
   types.ts       — TypeScript types for all API objects and webhook events
   api.test.ts    — Unit tests for BouncieClient
@@ -80,6 +80,19 @@ Verified empirically, not documented upstream. `src/trips.ts` depends on all of 
 - **`transactionId` is `{imei}-{sequence}-{YYYYMM}`** and is the dedupe key across overlapping windows.
 
 Distances and odometer are **miles**; `totalIdleDuration` is **seconds**.
+
+### Geographic filtering
+
+Trip records have **no lat/lon fields** — position exists only inside `gps`. Any
+bbox filter must therefore fetch geometry (`needGps` in `fetchTripsRange`),
+decode the polyline, test the box, then strip the geometry again unless the
+caller asked for it. GPS-bearing chunks are cached under a `:gps` key suffix with
+a much smaller entry budget, so they cannot displace the stripped chunks that
+serve the common path.
+
+A bbox-filtered summary totals the **whole** of each matching trip, including
+distance driven outside the box. That is stated in the response `note`; do not
+change it to clip distance without also changing that text.
 - **User:** GET `/v1/user`
 
 ## Environment variables
