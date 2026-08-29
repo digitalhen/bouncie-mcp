@@ -9,6 +9,9 @@ import { createOAuthRouter, isValidToken, getBouncieToken } from "./oauth.js";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 const TOKEN_TTL_HOURS = parseInt(process.env.TOKEN_TTL_HOURS || "24", 10);
+// Keep the OAuth store off the image layer so redeploys don't sign everyone out
+// or strand users part-way through the authorization flow.
+const DATA_DIR = process.env.DATA_DIR || process.cwd();
 
 const BOUNCIE_CLIENT_ID = process.env.BOUNCIE_CLIENT_ID;
 const BOUNCIE_CLIENT_SECRET = process.env.BOUNCIE_CLIENT_SECRET;
@@ -40,7 +43,7 @@ app.use(createOAuthRouter({
   tokenTtlMs: TOKEN_TTL_HOURS * 60 * 60 * 1000,
   bouncieClientId: BOUNCIE_CLIENT_ID,
   bouncieClientSecret: BOUNCIE_CLIENT_SECRET,
-}));
+}, DATA_DIR));
 
 // Bearer token auth for /mcp — extract Bouncie token for the session
 const RESOURCE_METADATA_URL = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;

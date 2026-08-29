@@ -9,3 +9,9 @@ services:
       - .env
     environment:
       - PORT=3000
+      - DATA_DIR=/data
+    volumes:
+      - bouncie-mcp-data:/data
+
+volumes:
+  bouncie-mcp-data:

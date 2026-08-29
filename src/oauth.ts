@@ -50,6 +50,11 @@ interface PendingBouncieAuth {
 interface StoreData {
   accessTokens: Record<string, TokenRecord>;
   registeredClients: Record<string, RegisteredClient>;
+  /** In-flight authorization codes and pending Bouncie redirects. These are
+   *  short-lived, but a restart mid-flow must not strand a user who is part-way
+   *  through authorizing — deploys are frequent enough to hit that window. */
+  authCodes?: Record<string, AuthCode>;
+  pendingBouncieAuths?: Record<string, PendingBouncieAuth>;
 }
 
 const authCodes = new Map<string, AuthCode>();
@@ -71,7 +76,16 @@ function initStore(dataDir: string) {
       for (const [k, v] of Object.entries(raw.registeredClients || {})) {
         registeredClients.set(k, v);
       }
-      console.log(`[oauth] Restored ${accessTokens.size} tokens and ${registeredClients.size} clients from disk`);
+      for (const [k, v] of Object.entries(raw.authCodes || {})) {
+        if (v.expiresAt > now) authCodes.set(k, v);
+      }
+      for (const [k, v] of Object.entries(raw.pendingBouncieAuths || {})) {
+        if (now - v.createdAt < 10 * 60 * 1000) pendingBouncieAuths.set(k, v);
+      }
+      console.log(
+        `[oauth] Restored ${accessTokens.size} tokens, ${registeredClients.size} clients, ` +
+          `${authCodes.size} auth codes, ${pendingBouncieAuths.size} pending auths from disk`,
+      );
     }
   } catch (err: any) {
     console.warn(`[oauth] Failed to load OAuth store: ${err.message}`);
@@ -83,6 +97,8 @@ function saveStore() {
     const data: StoreData = {
       accessTokens: Object.fromEntries(accessTokens),
       registeredClients: Object.fromEntries(registeredClients),
+      authCodes: Object.fromEntries(authCodes),
+      pendingBouncieAuths: Object.fromEntries(pendingBouncieAuths),
     };
     fs.writeFileSync(storePath, JSON.stringify(data, null, 2), "utf8");
   } catch (err: any) {
@@ -95,7 +111,10 @@ setInterval(() => {
   const now = Date.now();
   let changed = false;
   for (const [code, data] of authCodes) {
-    if (data.expiresAt < now) authCodes.delete(code);
+    if (data.expiresAt < now) {
+      authCodes.delete(code);
+      changed = true;
+    }
   }
   for (const [token, data] of accessTokens) {
     if (data.expiresAt < now) {
@@ -107,6 +126,7 @@ setInterval(() => {
   for (const [state, data] of pendingBouncieAuths) {
     if (now - data.createdAt > 10 * 60 * 1000) {
       pendingBouncieAuths.delete(state);
+      changed = true;
     }
   }
   if (changed) saveStore();
@@ -267,6 +287,8 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       grant_types: ["authorization_code"],
       response_types: ["code"],
       token_endpoint_auth_method: "client_secret_post",
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      client_secret_expires_at: 0,
     });
   });
 
@@ -301,6 +323,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       mcpState: state,
       createdAt: Date.now(),
     });
+    saveStore();
 
     // Redirect user to Bouncie's authorization page
     const bouncieAuthUrl = new URL(BOUNCIE_AUTH_DIALOG);
@@ -331,6 +354,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
     pendingBouncieAuths.delete(state);
+    saveStore();
 
     try {
       // Exchange Bouncie auth code for Bouncie access token
@@ -346,6 +370,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
         bouncieAccessToken,
         expiresAt: Date.now() + 10 * 60 * 1000,
       });
+      saveStore();
 
       // Redirect back to Claude.ai with the MCP auth code
       const redirectUrl = new URL(pending.redirectUri);
