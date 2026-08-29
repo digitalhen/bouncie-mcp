@@ -49,9 +49,16 @@ app.use(createOAuthRouter({
 const RESOURCE_METADATA_URL = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
 
 app.use("/mcp", (req, res, next) => {
+  console.log(
+    `[mcp] ${req.method} /mcp session=${req.headers["mcp-session-id"] || "none"} ` +
+      `auth=${req.headers.authorization ? "present" : "MISSING"} ` +
+      `accept=${req.headers.accept || "none"}`,
+  );
+
   // The MCP auth spec requires 401s to point at the protected-resource metadata,
   // which is how the client discovers where to start the OAuth flow.
   const challenge = (error: string, description: string) => {
+    console.warn(`[mcp] 401 on ${req.method} /mcp: ${description}`);
     res.setHeader(
       "WWW-Authenticate",
       `Bearer resource_metadata="${RESOURCE_METADATA_URL}", error="${error}", error_description="${description}"`,
@@ -113,14 +120,23 @@ app.post("/mcp", async (req, res) => {
     if (sid) cleanupTransport(sid);
   };
 
-  await mcpServer.connect(transport);
-  await transport.handleRequest(req, res);
+  try {
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res);
+  } catch (err: any) {
+    console.error(`[mcp] POST /mcp failed: ${err?.stack || err?.message || err}`);
+    if (!res.headersSent) res.status(500).json({ error: "Internal error" });
+  }
 });
 
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports.has(sessionId)) {
-    res.status(400).json({ error: "Invalid or missing session" });
+    // A client may open an SSE stream before it holds a session. That is not an
+    // error worth failing the connection over — say the method isn't available.
+    console.warn(`[mcp] GET /mcp with no live session (${sessionId || "none"}) — 405`);
+    res.setHeader("Allow", "POST, DELETE");
+    res.status(405).json({ error: "Method Not Allowed" });
     return;
   }
   await transports.get(sessionId)!.handleRequest(req, res);
@@ -129,7 +145,8 @@ app.get("/mcp", async (req, res) => {
 app.delete("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports.has(sessionId)) {
-    res.status(400).json({ error: "Invalid or missing session" });
+    console.warn(`[mcp] DELETE /mcp with no live session (${sessionId || "none"})`);
+    res.status(404).json({ error: "Session not found" });
     return;
   }
   await transports.get(sessionId)!.handleRequest(req, res);
