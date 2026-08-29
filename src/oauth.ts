@@ -22,6 +22,7 @@ interface AuthCode {
   redirectUri: string;
   bouncieAccessToken: string;
   expiresAt: number;
+  scope?: string;
 }
 
 interface TokenRecord {
@@ -29,6 +30,13 @@ interface TokenRecord {
   bouncieAccessToken: string;
   issuedAt: number;
   expiresAt: number;
+  scope?: string;
+}
+
+interface RefreshRecord {
+  clientId: string;
+  bouncieAccessToken: string;
+  scope?: string;
 }
 
 interface RegisteredClient {
@@ -44,6 +52,7 @@ interface PendingBouncieAuth {
   codeChallengeMethod?: string;
   redirectUri: string;
   mcpState?: string;
+  scope?: string;
   createdAt: number;
 }
 
@@ -55,12 +64,14 @@ interface StoreData {
    *  through authorizing — deploys are frequent enough to hit that window. */
   authCodes?: Record<string, AuthCode>;
   pendingBouncieAuths?: Record<string, PendingBouncieAuth>;
+  refreshTokens?: Record<string, RefreshRecord>;
 }
 
 const authCodes = new Map<string, AuthCode>();
 const accessTokens = new Map<string, TokenRecord>();
 const registeredClients = new Map<string, RegisteredClient>();
 const pendingBouncieAuths = new Map<string, PendingBouncieAuth>();
+const refreshTokens = new Map<string, RefreshRecord>();
 
 let storePath = "";
 
@@ -82,6 +93,9 @@ function initStore(dataDir: string) {
       for (const [k, v] of Object.entries(raw.pendingBouncieAuths || {})) {
         if (now - v.createdAt < 10 * 60 * 1000) pendingBouncieAuths.set(k, v);
       }
+      for (const [k, v] of Object.entries(raw.refreshTokens || {})) {
+        refreshTokens.set(k, v);
+      }
       console.log(
         `[oauth] Restored ${accessTokens.size} tokens, ${registeredClients.size} clients, ` +
           `${authCodes.size} auth codes, ${pendingBouncieAuths.size} pending auths from disk`,
@@ -99,6 +113,7 @@ function saveStore() {
       registeredClients: Object.fromEntries(registeredClients),
       authCodes: Object.fromEntries(authCodes),
       pendingBouncieAuths: Object.fromEntries(pendingBouncieAuths),
+      refreshTokens: Object.fromEntries(refreshTokens),
     };
     fs.writeFileSync(storePath, JSON.stringify(data, null, 2), "utf8");
   } catch (err: any) {
@@ -257,7 +272,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       token_endpoint: `${config.publicUrl}/token`,
       registration_endpoint: `${config.publicUrl}/register`,
       response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
       token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
       code_challenge_methods_supported: ["S256", "plain"],
       scopes_supported: ["bouncie"],
@@ -284,7 +299,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       client_secret: clientSecret,
       client_name: client_name || "MCP Client",
       redirect_uris: redirect_uris || [],
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "client_secret_post",
       client_id_issued_at: Math.floor(Date.now() / 1000),
@@ -301,12 +316,10 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       code_challenge,
       code_challenge_method,
       response_type,
+      scope,
     } = req.query as Record<string, string>;
 
-    console.log(
-      `[oauth] /authorize client=${client_id} redirect_uri=${redirect_uri} ` +
-        `state=${state ? "present" : "MISSING"} pkce=${code_challenge_method || "none"}`,
-    );
+    console.log(`[oauth] /authorize query=${JSON.stringify(req.query)}`);
 
     if (response_type !== "code") {
       res.status(400).send("Unsupported response_type");
@@ -321,6 +334,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       codeChallengeMethod: code_challenge_method,
       redirectUri: redirect_uri,
       mcpState: state,
+      scope,
       createdAt: Date.now(),
     });
     saveStore();
@@ -368,6 +382,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
         codeChallengeMethod: pending.codeChallengeMethod,
         redirectUri: pending.redirectUri,
         bouncieAccessToken,
+        scope: pending.scope,
         expiresAt: Date.now() + 10 * 60 * 1000,
       });
       saveStore();
@@ -399,10 +414,25 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       res.status(400).json({ error, error_description: description });
     };
 
-    console.log(
-      `[oauth] /token grant_type=${grant_type} code=${code ? "present" : "MISSING"} ` +
-        `verifier=${code_verifier ? "present" : "MISSING"} redirect_uri=${redirect_uri}`,
+    const redacted = Object.fromEntries(
+      Object.entries(req.body || {}).map(([k, v]) =>
+        /secret|verifier|code|token/i.test(k) ? [k, "<present>"] : [k, v],
+      ),
     );
+    console.log(`[oauth] /token body=${JSON.stringify(redacted)}`);
+
+    // Refresh grant — hand back a new access token for the same Bouncie session
+    if (grant_type === "refresh_token") {
+      const refresh = refreshTokens.get(req.body.refresh_token);
+      if (!refresh) {
+        reject("invalid_grant", "unknown refresh token");
+        return;
+      }
+      const issued = issueTokens(refresh.clientId, refresh.bouncieAccessToken, refresh.scope);
+      console.log(`[oauth] Refreshed access token for client ${refresh.clientId}`);
+      res.json(issued);
+      return;
+    }
 
     if (grant_type !== "authorization_code") {
       reject("unsupported_grant_type", `grant_type was ${grant_type}`);
@@ -444,26 +474,34 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
 
-    // Issue MCP access token that maps to the user's Bouncie token
+    authCodes.delete(code);
+    const issued = issueTokens(stored.clientId, stored.bouncieAccessToken, stored.scope);
+    console.log(`[oauth] Issued access token for client ${stored.clientId}`);
+    res.json(issued);
+  });
+
+  /** Mint an access token (and a refresh token) bound to a Bouncie session. */
+  function issueTokens(clientId: string, bouncieAccessToken: string, scope?: string) {
     const token = crypto.randomBytes(32).toString("hex");
+    const refreshToken = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
     accessTokens.set(token, {
-      clientId: stored.clientId,
-      bouncieAccessToken: stored.bouncieAccessToken,
+      clientId,
+      bouncieAccessToken,
+      scope,
       issuedAt: now,
       expiresAt: now + config.tokenTtlMs,
     });
-    authCodes.delete(code);
-
+    refreshTokens.set(refreshToken, { clientId, bouncieAccessToken, scope });
     saveStore();
-    console.log(`[oauth] Issued access token for client ${stored.clientId}`);
-
-    res.json({
+    return {
       access_token: token,
       token_type: "Bearer",
       expires_in: Math.floor(config.tokenTtlMs / 1000),
-    });
-  });
+      refresh_token: refreshToken,
+      ...(scope ? { scope } : {}),
+    };
+  }
 
   return router;
 }
