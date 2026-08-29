@@ -65,6 +65,11 @@ app.use("/mcp", (req, res, next) => {
   // The MCP auth spec requires 401s to point at the protected-resource metadata,
   // which is how the client discovers where to start the OAuth flow.
   const challenge = (error: string, description: string) => {
+    const a = req.headers.authorization;
+    console.warn(
+      `[mcp] 401 ${req.method} /mcp: ${description} ` +
+        `(bearer=${a ? a.slice(7, 17) + "…" : "ABSENT"})`,
+    );
     res.setHeader(
       "WWW-Authenticate",
       `Bearer resource_metadata="${RESOURCE_METADATA_URL}", error="${error}", error_description="${description}"`,
