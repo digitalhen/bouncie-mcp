@@ -14,6 +14,12 @@ import {
   stripGps,
   summarize,
   tripCacheSize,
+  decodePolyline,
+  tripPoints,
+  matchesBbox,
+  validateBbox,
+  countUnlocatable,
+  type BoundingBox,
 } from "./trips.js";
 
 function trip(overrides: Partial<Trip> & { transactionId: string; startTime: string }): Trip {
@@ -390,3 +396,174 @@ describe("stripGps", () => {
     expect(s.distance).toBe(t.distance);
   });
 });
+
+describe("geographic filtering", () => {
+  // Google-encoded polyline for a short route near Austin, TX.
+  // Encoded from [[30.2672,-97.7431],[30.2700,-97.7400],[30.2750,-97.7350]].
+  const austinRoute = encodePolylineForTest([
+    [30.2672, -97.7431],
+    [30.27, -97.74],
+    [30.275, -97.735],
+  ]);
+
+  const AUSTIN: BoundingBox = { min_lat: 30.2, min_lon: -97.8, max_lat: 30.3, max_lon: -97.7 };
+  const DALLAS: BoundingBox = { min_lat: 32.6, min_lon: -96.9, max_lat: 32.9, max_lon: -96.6 };
+
+  it("round-trips an encoded polyline", () => {
+    const points = decodePolyline(austinRoute);
+    expect(points).toHaveLength(3);
+    expect(points[0][0]).toBeCloseTo(30.2672, 4);
+    expect(points[0][1]).toBeCloseTo(-97.7431, 4);
+    expect(points[2][0]).toBeCloseTo(30.275, 4);
+  });
+
+  it("returns nothing for malformed polylines rather than throwing", () => {
+    expect(decodePolyline("")).toEqual([]);
+    expect(() => decodePolyline("!!!not-a-polyline!!!")).not.toThrow();
+  });
+
+  it("reads GeoJSON coordinates as [lon, lat] per RFC 7946", () => {
+    const t = trip({
+      transactionId: "g",
+      startTime: "2026-07-01T10:00:00Z",
+      gps: { type: "LineString", coordinates: [[-97.7431, 30.2672]] },
+    });
+    expect(tripPoints(t)[0][0]).toBeCloseTo(30.2672, 4);
+    expect(tripPoints(t)[0][1]).toBeCloseTo(-97.7431, 4);
+  });
+
+  describe("match modes", () => {
+    const t = trip({ transactionId: "a", startTime: "2026-07-01T10:00:00Z", gps: austinRoute });
+
+    it("intersects matches a route passing through the box", () => {
+      expect(matchesBbox(t, AUSTIN, "intersects")).toBe(true);
+      expect(matchesBbox(t, DALLAS, "intersects")).toBe(false);
+    });
+
+    it("start and end test only the respective endpoint", () => {
+      const startOnly: BoundingBox = {
+        min_lat: 30.266, min_lon: -97.744, max_lat: 30.268, max_lon: -97.742,
+      };
+      expect(matchesBbox(t, startOnly, "start")).toBe(true);
+      expect(matchesBbox(t, startOnly, "end")).toBe(false);
+    });
+
+    it("contains requires the whole route to stay inside", () => {
+      expect(matchesBbox(t, AUSTIN, "contains")).toBe(true);
+      const clipped: BoundingBox = {
+        min_lat: 30.266, min_lon: -97.744, max_lat: 30.271, max_lon: -97.739,
+      };
+      expect(matchesBbox(t, clipped, "intersects")).toBe(true);
+      expect(matchesBbox(t, clipped, "contains")).toBe(false);
+    });
+
+    it("never matches a trip with no decodable route", () => {
+      const noGps = trip({ transactionId: "n", startTime: "2026-07-01T10:00:00Z", gps: undefined });
+      expect(matchesBbox(noGps, AUSTIN, "intersects")).toBe(false);
+      expect(countUnlocatable([noGps])).toBe(1);
+    });
+  });
+
+  describe("validateBbox", () => {
+    it("accepts a well-formed box", () => {
+      expect(() => validateBbox(AUSTIN)).not.toThrow();
+    });
+    it("rejects inverted edges", () => {
+      expect(() => validateBbox({ ...AUSTIN, min_lat: 40 })).toThrow(/min_lat must be <=/);
+      expect(() => validateBbox({ ...AUSTIN, min_lon: 0 })).toThrow(/antimeridian/);
+    });
+    it("rejects out-of-range coordinates", () => {
+      expect(() => validateBbox({ ...AUSTIN, max_lat: 91 })).toThrow(/between -90 and 90/);
+      expect(() => validateBbox({ ...AUSTIN, min_lon: -181 })).toThrow(/between -180 and 180/);
+    });
+  });
+
+  describe("fetchTripsRange with a bbox", () => {
+    beforeEach(() => {
+      vi.spyOn(BouncieClient.prototype, "getTrips").mockResolvedValue([
+        trip({ transactionId: "in", startTime: "2026-07-01T10:00:00Z", gps: austinRoute }),
+        trip({
+          transactionId: "out",
+          startTime: "2026-07-02T10:00:00Z",
+          gps: encodePolylineForTest([[32.7767, -96.797]]),
+        }),
+      ]);
+    });
+
+    it("keeps only matching trips and reports what it removed", async () => {
+      const res = await fetchTripsRange(
+        client(), "862", new Date("2026-07-01Z"), new Date("2026-07-03Z"),
+        { bbox: AUSTIN, throttleMs: 0 },
+      );
+      expect(res.trips.map((t) => t.transactionId)).toEqual(["in"]);
+      expect(res.filtered_out).toBe(1);
+      expect(res.unlocatable).toBe(0);
+    });
+
+    it("strips the geometry it had to fetch, unless GPS was also requested", async () => {
+      const stripped = await fetchTripsRange(
+        client(), "862", new Date("2026-07-01Z"), new Date("2026-07-03Z"),
+        { bbox: AUSTIN, throttleMs: 0 },
+      );
+      expect("gps" in stripped.trips[0]).toBe(false);
+
+      clearTripCache();
+      const kept = await fetchTripsRange(
+        client(), "862", new Date("2026-07-01Z"), new Date("2026-07-03Z"),
+        { bbox: AUSTIN, includeGps: true, throttleMs: 0 },
+      );
+      expect(kept.trips[0].gps).toBeTruthy();
+    });
+
+    it("caches gps-bearing chunks separately from stripped ones", async () => {
+      const range = [new Date("2020-07-01Z"), new Date("2020-07-03Z")] as const;
+      await fetchTripsRange(client(), "862", range[0], range[1], { throttleMs: 0 });
+      const afterPlain = tripCacheSize();
+      await fetchTripsRange(client(), "862", range[0], range[1], { bbox: AUSTIN, throttleMs: 0 });
+      // A separate entry, so the stripped cache is not poisoned with geometry.
+      expect(tripCacheSize()).toBeGreaterThan(afterPlain);
+    });
+  });
+
+  it("summarize reports bbox provenance", () => {
+    const summary = summarize(
+      [trip({ transactionId: "a", startTime: "2026-07-05T14:00:00Z", endTime: "2026-07-05T15:00:00Z" })],
+      "month",
+      {
+        imei: "862", since: "2026-07-01", until: "2026-07-31", warnings: [],
+        bbox: AUSTIN, bboxMatch: "intersects", excludedByBbox: 4, unlocatable: 1,
+      },
+    );
+    expect(summary.bbox).toEqual(AUSTIN);
+    expect(summary.bbox_match).toBe("intersects");
+    expect(summary.excluded_by_bbox).toBe(4);
+    expect(summary.unlocatable_trips).toBe(1);
+    // The caveat that a matched trip counts in full must be stated in the payload.
+    expect(summary.note).toMatch(/ENTIRE distance/);
+  });
+});
+
+/** Minimal Google polyline encoder, so fixtures are readable as coordinates. */
+function encodePolylineForTest(points: Array<[number, number]>): string {
+  let lastLat = 0;
+  let lastLon = 0;
+  let out = "";
+  const chunk = (v: number) => {
+    let value = v < 0 ? ~(v << 1) : v << 1;
+    let s = "";
+    while (value >= 0x20) {
+      s += String.fromCharCode((0x20 | (value & 0x1f)) + 63);
+      value >>= 5;
+    }
+    s += String.fromCharCode(value + 63);
+    return s;
+  };
+  for (const [lat, lon] of points) {
+    const la = Math.round(lat * 1e5);
+    const lo = Math.round(lon * 1e5);
+    out += chunk(la - lastLat) + chunk(lo - lastLon);
+    lastLat = la;
+    lastLon = lo;
+  }
+  return out;
+}

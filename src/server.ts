@@ -9,9 +9,32 @@ import {
   endOfDay,
   isPartial,
   localTimeString,
+  matchesBbox,
   stripGps,
+  tripPoints,
+  validateBbox,
+  type BboxMatch,
+  type BoundingBox,
   type Period,
 } from "./trips.js";
+
+/** Shared bounding-box schema. Coordinates are decimal degrees, WGS84. */
+const bboxSchema = z
+  .object({
+    min_lat: z.number().describe("Southern edge, -90..90"),
+    min_lon: z.number().describe("Western edge, -180..180"),
+    max_lat: z.number().describe("Northern edge, -90..90"),
+    max_lon: z.number().describe("Eastern edge, -180..180"),
+  })
+  .describe(
+    "Geographic bounding box in decimal degrees (WGS84). Boxes crossing the antimeridian are not supported — use two.",
+  );
+
+const bboxMatchSchema = z
+  .enum(["intersects", "start", "end", "contains"])
+  .describe(
+    "How a trip must relate to the box: intersects = passes through it at any point (default), start = began inside, end = finished inside, contains = stayed entirely within.",
+  );
 
 function formatError(error: unknown): string {
   if (error instanceof BouncieApiError) {
@@ -100,7 +123,7 @@ export function createServer(options?: ServerOptions): McpServer {
 
   server.tool(
     "get_trips",
-    "Get individual trips for a vehicle. Requires IMEI. Optional date range (max 1 week window; defaults to last 7 days). Returns per-trip distance, duration, speeds, fuel consumed, and hard braking/acceleration counts. GPS route geometry is EXCLUDED by default because it dominates the payload — pass include_gps: true only when you actually need the route. For totals over more than a week (monthly series, before/after comparisons), use get_mileage_summary instead of paging this tool. All timestamps are UTC; use the timeZone field (e.g. '-0500') to convert to local time. A trip still in progress omits endTime, distance, and speeds.",
+    "Get individual trips for a vehicle. Requires IMEI. Optional date range (max 1 week window; defaults to last 7 days). Returns per-trip distance, duration, speeds, fuel consumed, and hard braking/acceleration counts. GPS route geometry is EXCLUDED by default because it dominates the payload — pass include_gps: true only when you actually need the route. For totals over more than a week (monthly series, before/after comparisons), use get_mileage_summary instead of paging this tool. All timestamps are UTC; use the timeZone field (e.g. '-0500') to convert to local time. A trip still in progress omits endTime, distance, and speeds. Pass bbox to keep only trips touching a geographic box — note that filtering requires the route to be fetched and decoded, since trip records carry no coordinates of their own.",
     {
       imei: z.string().describe("Device IMEI (required)"),
       starts_after: z.string().optional().describe("ISO date — only trips starting after this time (e.g. 2024-01-15)"),
@@ -114,9 +137,12 @@ export function createServer(options?: ServerOptions): McpServer {
         .optional()
         .describe("Format for GPS data when include_gps is true (default: polyline)"),
       transaction_id: z.string().optional().describe("Fetch a specific trip by its transaction ID"),
+      bbox: bboxSchema.optional(),
+      bbox_match: bboxMatchSchema.optional(),
     },
-    async ({ imei, starts_after, ends_before, include_gps, gps_format, transaction_id }) => {
+    async ({ imei, starts_after, ends_before, include_gps, gps_format, transaction_id, bbox, bbox_match }) => {
       try {
+        if (bbox) validateBbox(bbox as BoundingBox);
         const client = createClient();
         const trips = await client.getTrips({
           imei,
@@ -127,7 +153,43 @@ export function createServer(options?: ServerOptions): McpServer {
           gpsFormat: (gps_format as GpsFormat | undefined) ?? "polyline",
           transactionId: transaction_id,
         });
-        const payload = include_gps ? trips : trips.map(stripGps);
+
+        let result = trips;
+        let excluded = 0;
+        let unlocatable = 0;
+        if (bbox) {
+          // Position lives only inside the route geometry, so filtering has to
+          // decode it even when the caller does not want it back.
+          unlocatable = result.filter((t) => tripPoints(t).length === 0).length;
+          const before = result.length;
+          result = result.filter((t) =>
+            matchesBbox(t, bbox as BoundingBox, (bbox_match as BboxMatch) ?? "intersects"),
+          );
+          excluded = before - result.length;
+        }
+
+        const payload = include_gps ? result : result.map(stripGps);
+        if (bbox) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    bbox,
+                    bbox_match: bbox_match ?? "intersects",
+                    matched: payload.length,
+                    excluded_by_bbox: excluded,
+                    unlocatable_trips: unlocatable,
+                    trips: payload,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
         return {
           content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
         };
@@ -139,7 +201,7 @@ export function createServer(options?: ServerOptions): McpServer {
 
   server.tool(
     "get_mileage_summary",
-    "Aggregate driving totals for a vehicle over any date range, bucketed by day, week, month, or year. Use this for trend questions — monthly mileage series, before/after comparisons, year-over-year — instead of paging get_trips, which is capped at one week per call. Returns no GPS data at all. Per bucket: trip_count (moving trips), idle_events (zero-distance records, which still burn fuel), distance in miles and km, fuel consumed, driving and idle time, average speed, and hard braking/acceleration counts. Trips are bucketed by the vehicle's LOCAL date, so a 9pm trip stays in that day. Distances are summed from each trip's exact distance field, never from odometer differences.",
+    "Aggregate driving totals for a vehicle over any date range, bucketed by day, week, month, or year. Use this for trend questions — monthly mileage series, before/after comparisons, year-over-year — instead of paging get_trips, which is capped at one week per call. Returns no GPS data at all. Per bucket: trip_count (moving trips), idle_events (zero-distance records, which still burn fuel), distance in miles and km, fuel consumed, driving and idle time, average speed, and hard braking/acceleration counts. Trips are bucketed by the vehicle's LOCAL date, so a 9pm trip stays in that day. Distances are summed from each trip's exact distance field, never from odometer differences. Pass bbox to restrict the summary to trips touching a geographic area — a matched trip contributes its whole distance, including any portion outside the box.",
     {
       imei: z.string().describe("Device IMEI (required)"),
       since: z.string().describe("Start of range, inclusive (YYYY-MM-DD)"),
@@ -148,9 +210,12 @@ export function createServer(options?: ServerOptions): McpServer {
         .enum(["day", "week", "month", "year"])
         .optional()
         .describe("Bucket size (default: month)"),
+      bbox: bboxSchema.optional(),
+      bbox_match: bboxMatchSchema.optional(),
     },
-    async ({ imei, since, until, period }) => {
+    async ({ imei, since, until, period, bbox, bbox_match }) => {
       try {
+        if (bbox) validateBbox(bbox as BoundingBox);
         const client = createClient();
         const from = parseDate(since, "since");
         const to = endOfDay(until, "until");
@@ -161,12 +226,28 @@ export function createServer(options?: ServerOptions): McpServer {
           };
         }
 
-        const { trips, warnings } = await fetchTripsRange(client, imei, from, to);
+        const { trips, warnings, filtered_out, unlocatable } = await fetchTripsRange(
+          client,
+          imei,
+          from,
+          to,
+          bbox
+            ? { bbox: bbox as BoundingBox, bboxMatch: (bbox_match as BboxMatch) ?? "intersects" }
+            : {},
+        );
         const summary = summarize(trips, (period as Period) ?? "month", {
           imei,
           since,
           until,
           warnings,
+          ...(bbox
+            ? {
+                bbox: bbox as BoundingBox,
+                bboxMatch: (bbox_match as BboxMatch) ?? "intersects",
+                excludedByBbox: filtered_out,
+                unlocatable,
+              }
+            : {}),
         });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }],

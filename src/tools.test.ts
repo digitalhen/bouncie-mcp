@@ -242,6 +242,92 @@ describe("aggregation and payload-control tools", () => {
     });
   });
 
+  describe("geographic filtering", () => {
+    // Decodes to [30.29322,-97.67036] -> [30.29434,-97.66287] -> [30.29610,-97.65538],
+    // i.e. east Austin, TX — inside AUSTIN below.
+    const AUSTIN_ROUTE = "ss{wDvfcsQ_Fym@_Jym@";
+    const AUSTIN = { min_lat: 30.2, min_lon: -97.8, max_lat: 30.4, max_lon: -97.6 };
+
+    beforeEach(() => {
+      tripsFor = () => [
+        makeTrip({
+          transactionId: `${IMEI}-1-202607`,
+          startTime: "2026-07-01T14:00:00Z",
+          endTime: "2026-07-01T15:00:00Z",
+          distance: 12,
+          gps: AUSTIN_ROUTE,
+        }),
+        makeTrip({
+          transactionId: `${IMEI}-2-202607`,
+          startTime: "2026-07-02T14:00:00Z",
+          endTime: "2026-07-02T15:00:00Z",
+          distance: 40,
+          // Decodes to [50.5304,-3.57048] — Devon, UK. Nowhere near the box.
+          gps: "_flsHnjxTs@s@",
+        }),
+      ];
+    });
+
+    it("get_trips keeps only trips touching the box and still omits gps", async () => {
+      const client = await connect();
+      const res = await client.callTool({
+        name: "get_trips",
+        arguments: { imei: IMEI, bbox: AUSTIN },
+      });
+      const out = JSON.parse(textOf(res));
+      expect(out.matched).toBe(1);
+      expect(out.excluded_by_bbox).toBe(1);
+      expect(out.trips[0].transactionId).toBe(`${IMEI}-1-202607`);
+      expect("gps" in out.trips[0]).toBe(false);
+    });
+
+    it("get_trips can return the geometry it filtered on", async () => {
+      const client = await connect();
+      const res = await client.callTool({
+        name: "get_trips",
+        arguments: { imei: IMEI, bbox: AUSTIN, include_gps: true },
+      });
+      const out = JSON.parse(textOf(res));
+      expect(out.trips[0].gps).toBe(AUSTIN_ROUTE);
+    });
+
+    it("get_mileage_summary totals only the matching trips", async () => {
+      const client = await connect();
+      const res = await client.callTool({
+        name: "get_mileage_summary",
+        arguments: { imei: IMEI, since: "2026-07-01", until: "2026-07-03", bbox: AUSTIN },
+      });
+      const summary = JSON.parse(textOf(res));
+      expect(summary.totals.distance_mi).toBe(12);
+      expect(summary.totals.trip_count).toBe(1);
+      expect(summary.bbox).toEqual(AUSTIN);
+      expect(summary.excluded_by_bbox).toBe(1);
+      expect(summary.note).toMatch(/ENTIRE distance/);
+      expect(textOf(res)).not.toContain("gps");
+    });
+
+    it("rejects an invalid box with a usable message", async () => {
+      const client = await connect();
+      const res = await client.callTool({
+        name: "get_trips",
+        arguments: { imei: IMEI, bbox: { ...AUSTIN, max_lat: 200 } },
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toMatch(/between -90 and 90/);
+    });
+
+    it("supports the start match mode", async () => {
+      const client = await connect();
+      const res = await client.callTool({
+        name: "get_trips",
+        arguments: { imei: IMEI, bbox: AUSTIN, bbox_match: "start" },
+      });
+      const out = JSON.parse(textOf(res));
+      expect(out.bbox_match).toBe("start");
+      expect(out.matched).toBe(1);
+    });
+  });
+
   describe("get_odometer_at", () => {
     it("returns the nearest completed reading before the requested time", async () => {
       tripsFor = () => [

@@ -34,6 +34,9 @@ export type Period = "day" | "week" | "month" | "year";
 
 export interface FetchOptions {
   includeGps?: boolean;
+  /** Restrict to trips touching this box. Forces GPS to be fetched and decoded. */
+  bbox?: BoundingBox;
+  bboxMatch?: BboxMatch;
   /** Overridable for tests. */
   throttleMs?: number;
 }
@@ -43,6 +46,10 @@ export interface FetchResult {
   /** Date ranges that could not be fetched. Empty on a complete result. */
   warnings: string[];
   upstreamRequests: number;
+  /** Set when a bbox was applied: how many trips it removed. */
+  filtered_out?: number;
+  /** Trips whose route could not be decoded, so no box could include them. */
+  unlocatable?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +69,8 @@ interface CacheEntry {
 
 const OPEN_WINDOW_TTL_MS = 5 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 2000;
+/** Chunks retaining route geometry are much larger, so far fewer are kept. */
+const MAX_GPS_CACHE_ENTRIES = 150;
 
 const chunkCache = new Map<string, CacheEntry>();
 
@@ -84,7 +93,20 @@ function cacheGet(key: string): Trip[] | null {
   return hit.trips;
 }
 
-function cacheSet(key: string, trips: Trip[], windowEnd: Date) {
+function cacheSet(key: string, trips: Trip[], windowEnd: Date, withGps = false) {
+  const cap = withGps ? MAX_GPS_CACHE_ENTRIES : MAX_CACHE_ENTRIES;
+  if (withGps) {
+    let gpsEntries = 0;
+    for (const k of chunkCache.keys()) if (k.endsWith(":gps")) gpsEntries++;
+    if (gpsEntries >= cap) {
+      for (const k of chunkCache.keys()) {
+        if (k.endsWith(":gps")) {
+          chunkCache.delete(k);
+          break;
+        }
+      }
+    }
+  }
   if (chunkCache.size >= MAX_CACHE_ENTRIES) {
     // Cheap eviction: drop the oldest insertion.
     const oldest = chunkCache.keys().next().value;
@@ -183,6 +205,143 @@ export function localTimeString(iso: string, timeZone: string | undefined): stri
 }
 
 // ---------------------------------------------------------------------------
+// Geometry
+//
+// A trip record carries no coordinates of its own — position exists only inside
+// the `gps` field. Any geographic filter therefore has to fetch and decode the
+// route, even when the caller does not want geometry in the response.
+// ---------------------------------------------------------------------------
+
+export interface BoundingBox {
+  min_lat: number;
+  min_lon: number;
+  max_lat: number;
+  max_lon: number;
+}
+
+/** Which part of the route has to fall inside the box. */
+export type BboxMatch = "intersects" | "start" | "end" | "contains";
+
+export function validateBbox(box: BoundingBox): void {
+  const { min_lat, min_lon, max_lat, max_lon } = box;
+  for (const [name, v, lo, hi] of [
+    ["min_lat", min_lat, -90, 90],
+    ["max_lat", max_lat, -90, 90],
+    ["min_lon", min_lon, -180, 180],
+    ["max_lon", max_lon, -180, 180],
+  ] as const) {
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      throw new Error(`bbox.${name} must be a number`);
+    }
+    if (v < lo || v > hi) {
+      throw new Error(`bbox.${name} must be between ${lo} and ${hi}, got ${v}`);
+    }
+  }
+  if (min_lat > max_lat) throw new Error("bbox.min_lat must be <= bbox.max_lat");
+  // A box crossing the antimeridian would need min_lon > max_lon; not supported.
+  if (min_lon > max_lon) {
+    throw new Error(
+      "bbox.min_lon must be <= bbox.max_lon. Boxes spanning the antimeridian are not supported; use two boxes.",
+    );
+  }
+}
+
+/**
+ * Decode a Google-encoded polyline (precision 5) into [lat, lon] pairs.
+ * Returns an empty array for malformed input rather than throwing, so one bad
+ * trip cannot fail a whole range.
+ */
+export function decodePolyline(encoded: string): Array<[number, number]> {
+  const points: Array<[number, number]> = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+
+  while (index < encoded.length) {
+    let result = 0;
+    let shift = 0;
+    let byte: number;
+    do {
+      if (index >= encoded.length) return points;
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && shift < 32);
+    lat += result & 1 ? ~(result >> 1) : result >> 1;
+
+    result = 0;
+    shift = 0;
+    do {
+      if (index >= encoded.length) return points;
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20 && shift < 32);
+    lon += result & 1 ? ~(result >> 1) : result >> 1;
+
+    const point: [number, number] = [lat / 1e5, lon / 1e5];
+    if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) return points;
+    points.push(point);
+  }
+  return points;
+}
+
+/**
+ * Route points as [lat, lon]. GeoJSON coordinates are [lon, lat] per RFC 7946
+ * and are swapped here; encoded polylines are already [lat, lon].
+ */
+export function tripPoints(trip: Trip): Array<[number, number]> {
+  const gps = trip.gps;
+  if (!gps) return [];
+  if (typeof gps === "string") return decodePolyline(gps);
+  if (Array.isArray(gps.coordinates)) {
+    return gps.coordinates
+      .filter((c) => Array.isArray(c) && c.length >= 2)
+      .map((c) => [c[1], c[0]] as [number, number]);
+  }
+  return [];
+}
+
+function inBox(point: [number, number], box: BoundingBox): boolean {
+  return (
+    point[0] >= box.min_lat &&
+    point[0] <= box.max_lat &&
+    point[1] >= box.min_lon &&
+    point[1] <= box.max_lon
+  );
+}
+
+/**
+ * Whether a trip matches the box under the given rule. A trip whose route could
+ * not be decoded matches nothing — callers should report those separately rather
+ * than let them silently vanish.
+ */
+export function matchesBbox(
+  trip: Trip,
+  box: BoundingBox,
+  match: BboxMatch = "intersects",
+): boolean {
+  const points = tripPoints(trip);
+  if (points.length === 0) return false;
+  switch (match) {
+    case "start":
+      return inBox(points[0], box);
+    case "end":
+      return inBox(points[points.length - 1], box);
+    case "contains":
+      return points.every((p) => inBox(p, box));
+    case "intersects":
+    default:
+      return points.some((p) => inBox(p, box));
+  }
+}
+
+/** Trips with no usable geometry, which no box can include. */
+export function countUnlocatable(trips: Trip[]): number {
+  return trips.filter((t) => tripPoints(t).length === 0).length;
+}
+
+// ---------------------------------------------------------------------------
 // Trip classification
 // ---------------------------------------------------------------------------
 
@@ -241,7 +400,11 @@ export async function fetchTripsRange(
   options: FetchOptions = {},
 ): Promise<FetchResult> {
   const includeGps = options.includeGps ?? false;
+  const bbox = options.bbox;
   const throttleMs = options.throttleMs ?? THROTTLE_MS;
+  // Geometry is needed to evaluate a box even when the caller wants it stripped
+  // from the response.
+  const needGps = includeGps || !!bbox;
 
   const byId = new Map<string, Trip>();
   const warnings: string[] = [];
@@ -249,9 +412,10 @@ export async function fetchTripsRange(
   let first = true;
 
   for (const chunk of chunkRange(since, until)) {
-    const cacheKey = `${imei}:${chunk.start.toISOString()}:${chunk.end.toISOString()}`;
-    // GPS is only cached out, never in, so the cache serves the common path only.
-    const cached = includeGps ? null : cacheGet(cacheKey);
+    const cacheKey =
+      `${imei}:${chunk.start.toISOString()}:${chunk.end.toISOString()}` +
+      (needGps ? ":gps" : "");
+    const cached = cacheGet(cacheKey);
 
     let trips: Trip[] | null = cached;
 
@@ -289,9 +453,11 @@ export async function fetchTripsRange(
         }
       }
 
-      if (trips && !includeGps) {
-        trips = trips.map(stripGps);
-        cacheSet(cacheKey, trips, chunk.end);
+      if (trips) {
+        // Strip before caching when geometry is not needed at all, so the common
+        // path keeps the cache small.
+        if (!needGps) trips = trips.map(stripGps);
+        cacheSet(cacheKey, trips, chunk.end, needGps);
       }
     }
 
@@ -301,11 +467,25 @@ export async function fetchTripsRange(
     }
   }
 
-  const trips = [...byId.values()].sort(
+  let trips = [...byId.values()].sort(
     (a, b) => Date.parse(a.startTime) - Date.parse(b.startTime),
   );
 
-  return { trips, warnings, upstreamRequests };
+  if (!bbox) return { trips, warnings, upstreamRequests };
+
+  const before = trips.length;
+  const unlocatable = countUnlocatable(trips);
+  trips = trips.filter((t) => matchesBbox(t, bbox, options.bboxMatch ?? "intersects"));
+  // Geometry was only fetched to evaluate the box; drop it again unless asked for.
+  if (!includeGps) trips = trips.map(stripGps);
+
+  return {
+    trips,
+    warnings,
+    upstreamRequests,
+    filtered_out: before - trips.length,
+    unlocatable,
+  };
 }
 
 /** Drop route geometry, which dominates the payload and is rarely wanted. */
@@ -409,9 +589,15 @@ export interface MileageSummary {
   since: string;
   until: string;
   period: Period;
+  bbox?: BoundingBox;
+  bbox_match?: BboxMatch;
   buckets: Bucket[];
   totals: Omit<Bucket, "period">;
   partial_trips: number;
+  /** Present when a bbox was applied: trips excluded by it. */
+  excluded_by_bbox?: number;
+  /** Present when a bbox was applied: trips with no decodable route. */
+  unlocatable_trips?: number;
   warnings?: string[];
   note: string;
 }
@@ -420,7 +606,16 @@ export interface MileageSummary {
 export function summarize(
   trips: Trip[],
   period: Period,
-  meta: { imei: string; since: string; until: string; warnings: string[] },
+  meta: {
+    imei: string;
+    since: string;
+    until: string;
+    warnings: string[];
+    bbox?: BoundingBox;
+    bboxMatch?: BboxMatch;
+    excludedByBbox?: number;
+    unlocatable?: number;
+  },
 ): MileageSummary {
   const buckets = new Map<string, Accumulator>();
   const overall = emptyAccumulator();
@@ -449,15 +644,27 @@ export function summarize(
     since: meta.since,
     until: meta.until,
     period,
+    ...(meta.bbox ? { bbox: meta.bbox, bbox_match: meta.bboxMatch ?? "intersects" } : {}),
     buckets: ordered.map(([key, acc]) => finalize(key, acc)),
     totals,
     partial_trips: partial,
+    ...(meta.bbox
+      ? {
+          excluded_by_bbox: meta.excludedByBbox ?? 0,
+          unlocatable_trips: meta.unlocatable ?? 0,
+        }
+      : {}),
     ...(meta.warnings.length ? { warnings: meta.warnings } : {}),
     note:
       "Distances summed from each trip's own distance field, never from odometer " +
       "differences (startOdometer is rounded). Buckets use each trip's local time " +
       "zone. trip_count counts moving trips; zero-distance idle events are counted " +
       "separately in idle_events but their fuel and idle time are included. " +
-      "avg_speed is distance over moving time, excluding idle.",
+      "avg_speed is distance over moving time, excluding idle." +
+      (meta.bbox
+        ? " Totals cover only trips matching the bounding box; a matched trip " +
+          "contributes its ENTIRE distance and fuel, including the portion " +
+          "outside the box."
+        : ""),
   };
 }
