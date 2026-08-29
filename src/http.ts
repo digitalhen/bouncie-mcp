@@ -43,15 +43,27 @@ app.use(createOAuthRouter({
 }));
 
 // Bearer token auth for /mcp — extract Bouncie token for the session
+const RESOURCE_METADATA_URL = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
+
 app.use("/mcp", (req, res, next) => {
+  // The MCP auth spec requires 401s to point at the protected-resource metadata,
+  // which is how the client discovers where to start the OAuth flow.
+  const challenge = (error: string, description: string) => {
+    res.setHeader(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${RESOURCE_METADATA_URL}", error="${error}", error_description="${description}"`,
+    );
+    res.status(401).json({ error: description });
+  };
+
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) {
-    res.status(401).json({ error: "Unauthorized" });
+    challenge("invalid_request", "Unauthorized");
     return;
   }
   const mcpToken = auth.slice(7);
   if (!isValidToken(mcpToken)) {
-    res.status(401).json({ error: "Invalid or expired token" });
+    challenge("invalid_token", "Invalid or expired token");
     return;
   }
   // Attach Bouncie token to request for downstream use

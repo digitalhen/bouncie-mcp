@@ -204,8 +204,33 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
   initStore(dataDir || process.cwd());
   const router = Router();
 
-  // RFC 8414 metadata
-  router.get("/.well-known/oauth-authorization-server", (_req, res) => {
+  // CORS — Claude.ai fetches discovery/registration/token endpoints from the browser
+  router.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-protocol-version");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    if (req.method === "OPTIONS") {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  });
+
+  // RFC 9728 protected-resource metadata — required by the MCP auth spec so the
+  // client can discover which authorization server guards /mcp.
+  const protectedResourceMetadata = (_req: any, res: any) => {
+    res.json({
+      resource: `${config.publicUrl}/mcp`,
+      authorization_servers: [config.publicUrl],
+      bearer_methods_supported: ["header"],
+    });
+  };
+  router.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+  router.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
+
+  // RFC 8414 metadata — served at the root and at the path-suffixed variant that
+  // clients probe for an issuer with a path component.
+  const authServerMetadata = (_req: any, res: any) => {
     res.json({
       issuer: config.publicUrl,
       authorization_endpoint: `${config.publicUrl}/authorize`,
@@ -215,8 +240,12 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       grant_types_supported: ["authorization_code"],
       token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
       code_challenge_methods_supported: ["S256", "plain"],
+      scopes_supported: ["bouncie"],
     });
-  });
+  };
+  router.get("/.well-known/oauth-authorization-server", authServerMetadata);
+  router.get("/.well-known/oauth-authorization-server/mcp", authServerMetadata);
+  router.get("/.well-known/openid-configuration", authServerMetadata);
 
   // Dynamic client registration (RFC 7591)
   router.post("/register", (req, res) => {
