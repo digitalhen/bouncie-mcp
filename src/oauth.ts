@@ -4,172 +4,116 @@
 // Instead of a password gate, users authorize with their own Bouncie account.
 // The MCP server acts as an OAuth provider to Claude.ai while proxying
 // authorization to Bouncie's OAuth under the hood.
+//
+// Everything this server needs to remember is carried *inside* the values it
+// hands out, sealed with a key both instances derive identically. Nothing is
+// kept in memory or on disk, so the service runs correctly behind a load
+// balancer that fans requests across hosts: any instance can complete a flow
+// another instance began.
 // ---------------------------------------------------------------------------
 
 import { Router } from "express";
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
 
 // ---------------------------------------------------------------------------
-// Persistent stores — backed by a JSON file on disk
+// Sealed values — AES-256-GCM, authenticated, with a purpose label and expiry
 // ---------------------------------------------------------------------------
 
-interface AuthCode {
-  clientId: string;
-  codeChallenge?: string;
-  codeChallengeMethod?: string;
-  redirectUri: string;
-  bouncieAccessToken: string;
-  expiresAt: number;
-  scope?: string;
-}
-
-interface TokenRecord {
-  clientId: string;
-  bouncieAccessToken: string;
-  issuedAt: number;
-  expiresAt: number;
-  scope?: string;
-}
-
-interface RefreshRecord {
-  clientId: string;
-  bouncieAccessToken: string;
-  scope?: string;
-}
-
-interface RegisteredClient {
-  clientId: string;
-  clientSecret: string;
-  redirectUris: string[];
-}
-
-/** Pending Bouncie OAuth flow — maps our internal state to the original Claude.ai OAuth params */
-interface PendingBouncieAuth {
+/** The pending Bouncie flow, carried as the `state` we hand to Bouncie. */
+interface PendingAuth {
   clientId: string;
   codeChallenge?: string;
   codeChallengeMethod?: string;
   redirectUri: string;
   mcpState?: string;
   scope?: string;
-  createdAt: number;
 }
 
-interface StoreData {
-  accessTokens: Record<string, TokenRecord>;
-  registeredClients: Record<string, RegisteredClient>;
-  /** In-flight authorization codes and pending Bouncie redirects. These are
-   *  short-lived, but a restart mid-flow must not strand a user who is part-way
-   *  through authorizing — deploys are frequent enough to hit that window. */
-  authCodes?: Record<string, AuthCode>;
-  pendingBouncieAuths?: Record<string, PendingBouncieAuth>;
-  refreshTokens?: Record<string, RefreshRecord>;
+/** The issued MCP authorization code. */
+interface AuthCode {
+  clientId: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+  redirectUri: string;
+  bouncieAccessToken: string;
+  scope?: string;
 }
 
-const authCodes = new Map<string, AuthCode>();
-const accessTokens = new Map<string, TokenRecord>();
-const registeredClients = new Map<string, RegisteredClient>();
-const pendingBouncieAuths = new Map<string, PendingBouncieAuth>();
-const refreshTokens = new Map<string, RefreshRecord>();
+/** An access or refresh token. */
+interface TokenPayload {
+  clientId: string;
+  bouncieAccessToken: string;
+  scope?: string;
+}
 
-let storePath = "";
+interface Sealed<T> {
+  p: string; // purpose
+  e: number; // expiry, epoch ms
+  d: T; // payload
+}
 
-function initStore(dataDir: string) {
-  storePath = path.join(dataDir, "oauth-store.json");
+let sealingKey: Buffer;
+
+/**
+ * Both instances must derive the same key without shared storage. TOKEN_SECRET
+ * is preferred; otherwise derive from the Bouncie client secret, which is by
+ * definition identical everywhere this app runs. Rotating that secret
+ * invalidates outstanding tokens, which is the correct behaviour anyway.
+ */
+function initSealingKey(explicitSecret: string | undefined, clientSecret: string) {
+  sealingKey = crypto.hkdfSync(
+    "sha256",
+    Buffer.from(explicitSecret || clientSecret, "utf8"),
+    Buffer.from("bouncie-mcp-oauth", "utf8"),
+    Buffer.from("sealing-key-v1", "utf8"),
+    32,
+  ) as unknown as Buffer;
+  sealingKey = Buffer.from(sealingKey);
+}
+
+function seal<T>(purpose: string, data: T, ttlMs: number): string {
+  const payload: Sealed<T> = { p: purpose, e: Date.now() + ttlMs, d: data };
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", sealingKey, iv);
+  const body = Buffer.concat([
+    cipher.update(JSON.stringify(payload), "utf8"),
+    cipher.final(),
+  ]);
+  return Buffer.concat([iv, cipher.getAuthTag(), body]).toString("base64url");
+}
+
+function unseal<T>(purpose: string, value: string | undefined): T | null {
+  if (!value) return null;
   try {
-    if (fs.existsSync(storePath)) {
-      const raw: StoreData = JSON.parse(fs.readFileSync(storePath, "utf8"));
-      const now = Date.now();
-      for (const [k, v] of Object.entries(raw.accessTokens || {})) {
-        if (v.expiresAt > now) accessTokens.set(k, v);
-      }
-      for (const [k, v] of Object.entries(raw.registeredClients || {})) {
-        registeredClients.set(k, v);
-      }
-      for (const [k, v] of Object.entries(raw.authCodes || {})) {
-        if (v.expiresAt > now) authCodes.set(k, v);
-      }
-      for (const [k, v] of Object.entries(raw.pendingBouncieAuths || {})) {
-        if (now - v.createdAt < 10 * 60 * 1000) pendingBouncieAuths.set(k, v);
-      }
-      for (const [k, v] of Object.entries(raw.refreshTokens || {})) {
-        refreshTokens.set(k, v);
-      }
-      console.log(
-        `[oauth] Restored ${accessTokens.size} tokens, ${registeredClients.size} clients, ` +
-          `${authCodes.size} auth codes, ${pendingBouncieAuths.size} pending auths from disk`,
-      );
-    }
-  } catch (err: any) {
-    console.warn(`[oauth] Failed to load OAuth store: ${err.message}`);
+    const raw = Buffer.from(value, "base64url");
+    if (raw.length < 29) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", sealingKey, raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const json = Buffer.concat([
+      decipher.update(raw.subarray(28)),
+      decipher.final(),
+    ]).toString("utf8");
+    const payload: Sealed<T> = JSON.parse(json);
+    if (payload.p !== purpose) return null;
+    if (payload.e < Date.now()) return null;
+    return payload.d;
+  } catch {
+    // Any tampering, a wrong key, or malformed input lands here.
+    return null;
   }
 }
-
-function saveStore() {
-  try {
-    const data: StoreData = {
-      accessTokens: Object.fromEntries(accessTokens),
-      registeredClients: Object.fromEntries(registeredClients),
-      authCodes: Object.fromEntries(authCodes),
-      pendingBouncieAuths: Object.fromEntries(pendingBouncieAuths),
-      refreshTokens: Object.fromEntries(refreshTokens),
-    };
-    fs.writeFileSync(storePath, JSON.stringify(data, null, 2), "utf8");
-  } catch (err: any) {
-    console.error(`[oauth] Failed to save OAuth store: ${err.message}`);
-  }
-}
-
-// Periodic cleanup
-setInterval(() => {
-  const now = Date.now();
-  let changed = false;
-  for (const [code, data] of authCodes) {
-    if (data.expiresAt < now) {
-      authCodes.delete(code);
-      changed = true;
-    }
-  }
-  for (const [token, data] of accessTokens) {
-    if (data.expiresAt < now) {
-      accessTokens.delete(token);
-      changed = true;
-    }
-  }
-  // Clean up expired pending Bouncie auths (10 min TTL)
-  for (const [state, data] of pendingBouncieAuths) {
-    if (now - data.createdAt > 10 * 60 * 1000) {
-      pendingBouncieAuths.delete(state);
-      changed = true;
-    }
-  }
-  if (changed) saveStore();
-}, 60_000);
 
 // ---------------------------------------------------------------------------
 // Token validation & Bouncie token lookup — used by MCP auth middleware
 // ---------------------------------------------------------------------------
 
 export function isValidToken(token: string): boolean {
-  const record = accessTokens.get(token);
-  if (!record) return false;
-  if (record.expiresAt < Date.now()) {
-    accessTokens.delete(token);
-    return false;
-  }
-  return true;
+  return unseal<TokenPayload>("access", token) !== null;
 }
 
 /** Look up the Bouncie access token associated with an MCP bearer token */
 export function getBouncieToken(mcpToken: string): string | null {
-  const record = accessTokens.get(mcpToken);
-  if (!record) return null;
-  if (record.expiresAt < Date.now()) {
-    accessTokens.delete(mcpToken);
-    return null;
-  }
-  return record.bouncieAccessToken;
+  return unseal<TokenPayload>("access", mcpToken)?.bouncieAccessToken ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +138,8 @@ export interface OAuthConfig {
   tokenTtlMs: number;
   bouncieClientId: string;
   bouncieClientSecret: string;
+  /** Optional explicit key material; defaults to deriving from the client secret. */
+  tokenSecret?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +148,8 @@ export interface OAuthConfig {
 
 const BOUNCIE_AUTH_DIALOG = "https://auth.bouncie.com/dialog/authorize";
 const BOUNCIE_TOKEN_URL = "https://auth.bouncie.com/oauth/token";
+
+const AUTH_FLOW_TTL_MS = 10 * 60 * 1000;
 
 async function exchangeBouncieCode(
   code: string,
@@ -235,8 +183,8 @@ async function exchangeBouncieCode(
 // Routes
 // ---------------------------------------------------------------------------
 
-export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router {
-  initStore(dataDir || process.cwd());
+export function createOAuthRouter(config: OAuthConfig): Router {
+  initSealingKey(config.tokenSecret, config.bouncieClientSecret);
   const router = Router();
 
   // CORS — Claude.ai fetches discovery/registration/token endpoints from the browser
@@ -281,17 +229,13 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
   router.get("/.well-known/oauth-authorization-server/mcp", authServerMetadata);
   router.get("/.well-known/openid-configuration", authServerMetadata);
 
-  // Dynamic client registration (RFC 7591)
+  // Dynamic client registration (RFC 7591). Registrations are not retained:
+  // client identity is not what secures this server — PKCE and the sealed
+  // authorization code are — and retaining them would require shared storage.
   router.post("/register", (req, res) => {
     const { redirect_uris, client_name } = req.body;
     const clientId = crypto.randomUUID();
     const clientSecret = crypto.randomBytes(32).toString("hex");
-    registeredClients.set(clientId, {
-      clientId,
-      clientSecret,
-      redirectUris: redirect_uris || [],
-    });
-    saveStore();
     console.log(`[oauth] Registered client: ${client_name || clientId}`);
     res.status(201).json({
       client_id: clientId,
@@ -327,26 +271,31 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       res.status(400).send("Unsupported response_type");
       return;
     }
+    if (!redirect_uri) {
+      res.status(400).send("Missing redirect_uri");
+      return;
+    }
 
-    // Generate internal state for the Bouncie OAuth flow
-    const internalState = crypto.randomBytes(16).toString("hex");
-    pendingBouncieAuths.set(internalState, {
-      clientId: client_id,
-      codeChallenge: code_challenge,
-      codeChallengeMethod: code_challenge_method,
-      redirectUri: redirect_uri,
-      mcpState: state,
-      scope,
-      createdAt: Date.now(),
-    });
-    saveStore();
+    // The pending flow travels as the `state` Bouncie will hand back to us.
+    const sealedState = seal<PendingAuth>(
+      "pending",
+      {
+        clientId: client_id,
+        codeChallenge: code_challenge,
+        codeChallengeMethod: code_challenge_method,
+        redirectUri: redirect_uri,
+        mcpState: state,
+        scope,
+      },
+      AUTH_FLOW_TTL_MS,
+    );
 
     // Redirect user to Bouncie's authorization page
     const bouncieAuthUrl = new URL(BOUNCIE_AUTH_DIALOG);
     bouncieAuthUrl.searchParams.set("client_id", config.bouncieClientId);
     bouncieAuthUrl.searchParams.set("redirect_uri", `${config.publicUrl}/callback`);
     bouncieAuthUrl.searchParams.set("response_type", "code");
-    bouncieAuthUrl.searchParams.set("state", internalState);
+    bouncieAuthUrl.searchParams.set("state", sealedState);
 
     res.redirect(302, bouncieAuthUrl.toString());
   });
@@ -362,32 +311,31 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
 
-    const pending = pendingBouncieAuths.get(state);
+    const pending = unseal<PendingAuth>("pending", state);
     if (!pending) {
       res.status(400).type("html").send(
         `<html><body><h1>Invalid State</h1><p>OAuth state is invalid or expired. Please try again.</p></body></html>`,
       );
       return;
     }
-    pendingBouncieAuths.delete(state);
-    saveStore();
 
     try {
       // Exchange Bouncie auth code for Bouncie access token
       const bouncieAccessToken = await exchangeBouncieCode(code, config);
 
       // Issue an MCP authorization code that carries the Bouncie token
-      const mcpCode = crypto.randomBytes(32).toString("hex");
-      authCodes.set(mcpCode, {
-        clientId: pending.clientId,
-        codeChallenge: pending.codeChallenge,
-        codeChallengeMethod: pending.codeChallengeMethod,
-        redirectUri: pending.redirectUri,
-        bouncieAccessToken,
-        scope: pending.scope,
-        expiresAt: Date.now() + 10 * 60 * 1000,
-      });
-      saveStore();
+      const mcpCode = seal<AuthCode>(
+        "code",
+        {
+          clientId: pending.clientId,
+          codeChallenge: pending.codeChallenge,
+          codeChallengeMethod: pending.codeChallengeMethod,
+          redirectUri: pending.redirectUri,
+          bouncieAccessToken,
+          scope: pending.scope,
+        },
+        AUTH_FLOW_TTL_MS,
+      );
 
       // Redirect back to Claude.ai with the MCP auth code
       const redirectUrl = new URL(pending.redirectUri);
@@ -396,7 +344,7 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
 
       console.log(
         `[oauth] Bouncie authorization complete for client ${pending.clientId}; ` +
-          `redirecting to ${pending.redirectUri} state=${pending.mcpState ? "present" : "MISSING"}`,
+          `redirecting to ${pending.redirectUri}`,
       );
       res.redirect(302, redirectUrl.toString());
     } catch (err: any) {
@@ -418,14 +366,13 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
 
     // Refresh grant — hand back a new access token for the same Bouncie session
     if (grant_type === "refresh_token") {
-      const refresh = refreshTokens.get(req.body.refresh_token);
+      const refresh = unseal<TokenPayload>("refresh", req.body.refresh_token);
       if (!refresh) {
-        reject("invalid_grant", "unknown refresh token");
+        reject("invalid_grant", "refresh token is invalid or expired");
         return;
       }
-      const issued = issueTokens(refresh.clientId, refresh.bouncieAccessToken, refresh.scope);
       console.log(`[oauth] Refreshed access token for client ${refresh.clientId}`);
-      res.json(issued);
+      res.json(issueTokens(refresh.clientId, refresh.bouncieAccessToken, refresh.scope));
       return;
     }
 
@@ -434,14 +381,9 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
 
-    const stored = authCodes.get(code);
+    const stored = unseal<AuthCode>("code", code);
     if (!stored) {
-      reject("invalid_grant", `no such authorization code (${authCodes.size} outstanding)`);
-      return;
-    }
-    if (stored.expiresAt < Date.now()) {
-      authCodes.delete(code);
-      reject("invalid_grant", "authorization code expired");
+      reject("invalid_grant", "authorization code is invalid or expired");
       return;
     }
 
@@ -469,31 +411,19 @@ export function createOAuthRouter(config: OAuthConfig, dataDir?: string): Router
       return;
     }
 
-    authCodes.delete(code);
-    const issued = issueTokens(stored.clientId, stored.bouncieAccessToken, stored.scope);
     console.log(`[oauth] Issued access token for client ${stored.clientId}`);
-    res.json(issued);
+    res.json(issueTokens(stored.clientId, stored.bouncieAccessToken, stored.scope));
   });
 
   /** Mint an access token (and a refresh token) bound to a Bouncie session. */
   function issueTokens(clientId: string, bouncieAccessToken: string, scope?: string) {
-    const token = crypto.randomBytes(32).toString("hex");
-    const refreshToken = crypto.randomBytes(32).toString("hex");
-    const now = Date.now();
-    accessTokens.set(token, {
-      clientId,
-      bouncieAccessToken,
-      scope,
-      issuedAt: now,
-      expiresAt: now + config.tokenTtlMs,
-    });
-    refreshTokens.set(refreshToken, { clientId, bouncieAccessToken, scope });
-    saveStore();
+    const payload: TokenPayload = { clientId, bouncieAccessToken, scope };
     return {
-      access_token: token,
+      access_token: seal("access", payload, config.tokenTtlMs),
       token_type: "Bearer",
       expires_in: Math.floor(config.tokenTtlMs / 1000),
-      refresh_token: refreshToken,
+      // Refresh outlives the access token so a session survives a quiet period.
+      refresh_token: seal("refresh", payload, 30 * 24 * 60 * 60 * 1000),
       ...(scope ? { scope } : {}),
     };
   }
